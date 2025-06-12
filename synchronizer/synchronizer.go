@@ -1,43 +1,67 @@
 package synchronizer
 
 import (
-	"errors"
-	"github.com/DQYXACML/vrf-node/common/tasks"
-	"github.com/DQYXACML/vrf-node/config"
-	"github.com/DQYXACML/vrf-node/synchronizer/node"
-	"github.com/ethereum/go-ethereum"
+	"fmt"
+	"github.com/DQYXACML/autopatch/common/tasks"
+	"github.com/DQYXACML/autopatch/config"
+	"github.com/DQYXACML/autopatch/database"
+	common2 "github.com/DQYXACML/autopatch/database/common"
+	"github.com/DQYXACML/autopatch/database/utils"
+	"github.com/DQYXACML/autopatch/database/worker"
+	sutils "github.com/DQYXACML/autopatch/storage/utils"
+	"github.com/DQYXACML/autopatch/synchronizer/node"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/google/uuid"
 	"math/big"
+	"os"
 	"time"
+)
+
+var (
+	storageLayoutJson = ``
 )
 
 type Synchronizer struct {
 	ethClient node.EthClient
+	db        *database.DB
 	chainCfg  *config.ChainConfig
 	tasks     tasks.Group
 
 	headers         []types.Header
+	latestHeader    *types.Header
 	headerTraversal *node.HeaderTraversal
 }
 
-func NewSynchronizer(cfg *config.Config, client node.EthClient) (*Synchronizer, error) {
+func NewSynchronizer(cfg *config.Config, db *database.DB, client node.EthClient) (*Synchronizer, error) {
+	latestHeader, err := db.Blocks.LatestBlockHeader()
+	if err != nil {
+		log.Error("query latest block header fail", "err", err)
+		return nil, err
+	}
+
 	var fromHeader *types.Header
-	if cfg.Chain.StartingHeight > 0 {
+	if latestHeader != nil {
+		fromHeader = latestHeader.RLPHeader.Header()
+	} else if cfg.Chain.StartingHeight > 0 {
 		header, err := client.BlockHeaderByNumber(big.NewInt(int64(cfg.Chain.StartingHeight)))
 		if err != nil {
 			log.Error("get block from chain fail", "err", err)
 			return nil, err
 		}
 		fromHeader = header
+	} else {
+		log.Info("no eth block indexed state")
 	}
 
 	headerTraversal := node.NewHeaderTraversal(client, fromHeader, big.NewInt(0), cfg.Chain.ChainId)
 	return &Synchronizer{
 		ethClient:       client,
+		db:              db,
 		chainCfg:        &cfg.Chain,
 		headerTraversal: headerTraversal,
+		latestHeader:    fromHeader,
 		tasks:           tasks.Group{},
 	}, nil
 }
@@ -88,37 +112,93 @@ func (syncer *Synchronizer) processBatch(headers []types.Header) error {
 		headerMap[header.Hash()] = &header
 	}
 	var addressList []common.Address
-	addressList = append(addressList, common.HexToAddress("0x2bf417A46a595Facd902111c13008Cb3ECD536b7"))
-	addressList = append(addressList, common.HexToAddress("0x21EA59025C4a16E948224D100D97c3a24706C728"))
 
-	filterQuery := ethereum.FilterQuery{
-		FromBlock: firstHeader.Number,
-		ToBlock:   lastHead.Number,
-		Addresses: addressList,
-	}
-	logs, err := syncer.ethClient.FilterLogs(filterQuery)
+	addressList, err := syncer.db.Protected.QueryProtectedAddAddressList()
 	if err != nil {
-		log.Error("filter logs fail", "err", err)
+		log.Error("QueryProtectedAddAddressList fail", "err", err)
 		return err
 	}
 
-	if logs.ToBlockHeader.Number.Cmp(lastHead.Number) != 0 {
-		return errors.New("mismatch in filter#toBlock numer")
-	} else if logs.ToBlockHeader.Hash() != lastHead.Hash() {
-		return errors.New("mismatch in filter#toBlock hash")
-	}
+	log.Info("Protected address list", "addresses", addressList)
 
-	if len(logs.Logs) > 0 {
-		log.Info("detected logs", "size", len(logs.Logs))
-	}
-
-	for i := range logs.Logs {
-		logEvent := logs.Logs[i]
-		if _, ok := headerMap[logEvent.BlockHash]; !ok {
+	// 存储header结构
+	blockHeaders := make([]common2.BlockHeader, 0, len(headers))
+	for i := range headers {
+		if headers[i].Number == nil {
 			continue
 		}
-		timestamp := headerMap[logEvent.BlockHash].Time
-		log.Info("event logs", "address", logs.Logs[i].Address, "timestamp", timestamp)
+		bHeader := common2.BlockHeader{
+			Hash:       headers[i].Hash(),
+			ParentHash: headers[i].ParentHash,
+			Number:     headers[i].Number,
+			Timestamp:  headers[i].Time,
+			RLPHeader:  (*utils.RLPHeader)(&headers[i]),
+		}
+		blockHeaders = append(blockHeaders, bHeader)
+		// 写StorageState入库
+		if err := syncer.parseStorage(&headers[i]); err != nil {
+			log.Error("parseStorage fail", "err", err)
+			return err
+		}
+	}
+
+	// 写blockHeader入库
+	if err := syncer.db.Transaction(func(tx *database.DB) error {
+		if err := tx.Blocks.StoreBlockHeaders(blockHeaders); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		log.Error("StoreBlockHeaders fail", "err", err)
+		return err
+	}
+
+	return nil
+}
+
+func (syncer *Synchronizer) parseStorage(header *types.Header) error {
+	// 写StorageState入库
+	c := sutils.NewContract(common.HexToAddress("0xCcdaC991C3AB71dA4bB2510E79eA4B90e41128CB"), syncer.chainCfg.ChainRpcUrl)
+	fileContent, err := os.ReadFile("./synchronizer/StorageScan.json")
+	if err != nil {
+		log.Error("Read Json file failure:", err)
+	}
+	storageLayoutJson = string(fileContent)
+	err = c.ParseByStorageLayout(storageLayoutJson)
+	if err != nil {
+		log.Error("Parse Storage Layout Error: ", err)
+	}
+	storages, err := fetchOnChainValue(c, header)
+	if err != nil {
+		log.Error("Fetch Storages error: ", err)
+		return err
+	}
+	// 写storages入库
+	if err := syncer.db.Transaction(func(tx *database.DB) error {
+		if err := tx.ProtectedStorage.StoreProtectedStorage(storages); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		log.Error("StoreProtectedStorage fail", "err", err)
+		return err
 	}
 	return nil
+}
+
+func fetchOnChainValue(c *sutils.Contract, header *types.Header) ([]worker.ProtectedStorage, error) {
+	vars := c.GetAllVariables()
+	storages := make([]worker.ProtectedStorage, 0, len(vars))
+	for _, v := range vars {
+		val := c.GetVariableValue(v.Name)
+		storage := worker.ProtectedStorage{
+			GUID:             uuid.New(),
+			ProtectedAddress: c.Address,
+			StorageKey:       v.Name,
+			StorageValue:     fmt.Sprintf("%v", val),
+			Number:           header.Number,
+		}
+		storages = append(storages, storage)
+	}
+	return storages, nil
 }

@@ -3,7 +3,7 @@ package node
 import (
 	"errors"
 	"fmt"
-	"github.com/DQYXACML/vrf-node/common/bigint"
+	"github.com/DQYXACML/autopatch/common/bigint"
 	"github.com/ethereum/go-ethereum/core/types"
 	"math/big"
 )

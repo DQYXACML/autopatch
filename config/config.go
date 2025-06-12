@@ -1,7 +1,7 @@
 package config
 
 import (
-	"github.com/DQYXACML/vrf-node/flags"
+	"github.com/DQYXACML/autopatch/flags"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/urfave/cli/v2"
@@ -9,7 +9,9 @@ import (
 )
 
 type Config struct {
-	Chain ChainConfig
+	Chain    ChainConfig
+	MasterDB DBConfig
+	SlaveDB  DBConfig
 }
 
 type ChainConfig struct {
@@ -33,6 +35,14 @@ type ChainConfig struct {
 	Passphrase                string
 }
 
+type DBConfig struct {
+	Host     string
+	Port     int
+	Name     string
+	User     string
+	Password string
+}
+
 func LoadConfig(cliCtx *cli.Context) (Config, error) {
 	cfg := NewConfig(cliCtx)
 	log.Info("loaded chain config")
@@ -53,6 +63,14 @@ func NewConfig(cliCtx *cli.Context) Config {
 			MainLoopInterval: cliCtx.Duration(flags.MainIntervalFlag.Name),
 			BlockStep:        cliCtx.Uint64(flags.BlocksStepFlag.Name),
 			StartingHeight:   cliCtx.Uint64(flags.StartingHeightFlag.Name),
+			EventInterval:    cliCtx.Duration(flags.EventIntervalFlag.Name),
+		},
+		MasterDB: DBConfig{
+			Host:     cliCtx.String(flags.MasterDbHostFlag.Name),
+			Port:     cliCtx.Int(flags.MasterDbPortFlag.Name),
+			Name:     cliCtx.String(flags.MasterDbNameFlag.Name),
+			User:     cliCtx.String(flags.MasterDbUserFlag.Name),
+			Password: cliCtx.String(flags.MasterDbPasswordFlag.Name),
 		},
 	}
 }

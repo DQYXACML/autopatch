@@ -7,7 +7,7 @@ import (
 
 var Flags []cli.Flag
 
-const envVarPrefix = "VRF_NODE"
+const envVarPrefix = "AUTOPATCH"
 
 func prefixEnvVars(name string) []string {
 	return []string{envVarPrefix + "_" + name}
@@ -17,14 +17,14 @@ var RequiredFlags []cli.Flag = []cli.Flag{
 	//MigrationFlag,
 	ChainIdFlag,
 	ChainRpcFlag,
-	//MasterDbHostFlag,
-	//MasterDbPortFlag,
-	//MasterDbUserFlag,
-	//MasterDbPasswordFlag,
-	//MasterDbNameFlag,
+	MasterDbHostFlag,
+	MasterDbPortFlag,
+	MasterDbUserFlag,
+	MasterDbPasswordFlag,
+	MasterDbNameFlag,
 	MainIntervalFlag,
 	BlocksStepFlag,
-	//EventIntervalFlag,
+	EventIntervalFlag,
 	//CallIntervalFlag,
 	//PrivateKeyFlag,
 	//VrfContractAddressFlag,

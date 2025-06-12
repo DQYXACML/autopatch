@@ -3,11 +3,11 @@ BLS_FACTORY_ABI_ARTIFACT := ./abis/DappLinkVRFFactory.sol/DappLinkVRFFactory.jso
 BLS_ABI_ARTIFACT := ./abis/BLSApkRegistry.sol/BLSApkRegistry.json
 
 
-vrf-node:
-	env GO111MODULE=on go build  ./cmd/vrf-node
+autopatch:
+	env GO111MODULE=on go build  ./cmd/autopatch
 
 clean:
-	rm vrf-node
+	rm auto-patch
 
 test:
 	go test -v ./...
@@ -69,7 +69,7 @@ binding-factory:
 
 
 .PHONY: \
-	vrf-node \
+	autopatch \
 	bindings \
 	binding-vrf \
 	binding-bls \

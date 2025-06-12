@@ -1,22 +1,22 @@
 package main
 
 import (
-	"github.com/DQYXACML/autopath/common/cliapp"
-	"github.com/DQYXACML/autopath/config"
-	"github.com/DQYXACML/autopath/flags"
-	vrf_node "github.com/DQYXACML/vrf-node"
+	auto_patch "github.com/DQYXACML/autopatch"
+	"github.com/DQYXACML/autopatch/common/cliapp"
+	"github.com/DQYXACML/autopatch/config"
+	"github.com/DQYXACML/autopatch/flags"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/urfave/cli/v2"
 )
 
-func runVRFNode(ctx *cli.Context) (cliapp.Lifecycle, error) {
-	log.Info("test in runVRFNode")
+func runAutoPatchNode(ctx *cli.Context) (cliapp.Lifecycle, error) {
+	log.Info("test in runAutoPatchNode")
 	cfg, err := config.LoadConfig(ctx)
 	if err != nil {
 		log.Error("failed to load config", "error", err)
 		return nil, err
 	}
-	return vrf_node.NewVrfNode(ctx.Context, &cfg)
+	return auto_patch.NewAutoPatch(ctx.Context, &cfg)
 }
 
 func NewCli() *cli.App {
@@ -30,7 +30,7 @@ func NewCli() *cli.App {
 				Name:        "index",
 				Description: "Runs the indexing service",
 				Flags:       myFlags,
-				Action:      cliapp.LifecycleCmd(runVRFNode),
+				Action:      cliapp.LifecycleCmd(runAutoPatchNode),
 			},
 			{
 				Name:        "version",

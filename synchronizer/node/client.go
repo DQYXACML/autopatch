@@ -8,14 +8,31 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rpc"
-	"log"
+	"github.com/ethereum/go-ethereum/signer/storage"
 	"math/big"
 	"time"
 )
 
+const (
+	defaultDialTimeout = 5 * time.Second
+
+	defaultRequestTimeout = 100 * time.Second
+)
+
 type myClient struct {
 	rpc RPC
+}
+
+func (m *myClient) DebugTraceAll(address common.Address) ([]byte, error) {
+	log.Info("DebugTraceAll called", "address: ", address.Hex())
+	return nil, fmt.Errorf("DebugTraceAll is not implemented")
+}
+
+func (m *myClient) GetStorageAt(hash common.Hash) (storage.Storage, error) {
+	log.Info("GetStorageAt called", "hash: ", hash.Hex())
+	return nil, fmt.Errorf("GetStorageAt is not implemented")
 }
 
 func (m *myClient) BlockHeadersByRange(startHeight *big.Int, engHeight *big.Int, chainId uint) ([]types.Header, error) {
@@ -69,38 +86,90 @@ func (m *myClient) BlockHeaderByNumber(b *big.Int) (*types.Header, error) {
 	var header *types.Header
 	err := m.rpc.CallContext(ctxwt, &header, "eth_getBlockByNumber", toBlockNumArg(b), false)
 	if err != nil {
-		log.Fatalln("Call eth_getBlockByNumber method fail", "err", err)
+		log.Error("Call eth_getBlockByNumber method fail", "err", err)
 		return nil, err
 	} else if header == nil {
-		log.Println("header not found")
+		log.Error("header not found")
 		return nil, ethereum.NotFound
 	}
 	return header, nil
 }
 
-func (m *myClient) LatestBlockNumber() (*types.Header, error) {
-	//TODO implement me
-	panic("implement me")
+func (m *myClient) LatestSafeBlockHeader() (*types.Header, error) {
+	ctxwt, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+
+	var header *types.Header
+	err := m.rpc.CallContext(ctxwt, &header, "eth_getBlockByNumber", "safe", false)
+	if err != nil {
+		return nil, err
+	} else if header == nil {
+		return nil, ethereum.NotFound
+	}
+
+	return header, nil
 }
 
 func (m *myClient) LatestFinalizedBlockHeader() (*types.Header, error) {
-	//TODO implement me
-	panic("implement me")
+	ctxwt, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+
+	var header *types.Header
+	err := m.rpc.CallContext(ctxwt, &header, "eth_getBlockByNumber", "finalized", false)
+	if err != nil {
+		return nil, err
+	} else if header == nil {
+		return nil, ethereum.NotFound
+	}
+
+	return header, nil
 }
 
 func (m *myClient) BlockHeaderByHash(hash common.Hash) (*types.Header, error) {
-	//TODO implement me
-	panic("implement me")
+	ctxwt, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+
+	var header *types.Header
+	err := m.rpc.CallContext(ctxwt, &header, "eth_getBlockByHash", hash, false)
+	if err != nil {
+		return nil, err
+	} else if header == nil {
+		return nil, ethereum.NotFound
+	}
+
+	if header.Hash() != hash {
+		return nil, errors.New("header mismatch")
+	}
+
+	return header, nil
 }
 
 func (m *myClient) TxByHash(hash common.Hash) (*types.Transaction, error) {
-	//TODO implement me
-	panic("implement me")
+	ctxwt, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+
+	var tx *types.Transaction
+	err := m.rpc.CallContext(ctxwt, &tx, "eth_getTransactionByHash", hash)
+	if err != nil {
+		return nil, err
+	} else if tx == nil {
+		return nil, ethereum.NotFound
+	}
+
+	return tx, nil
 }
 
 func (m *myClient) StorageHash(address common.Address, b *big.Int) (common.Hash, error) {
-	//TODO implement me
-	panic("implement me")
+	ctxwt, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+
+	proof := struct{ StorageHash common.Hash }{}
+	err := m.rpc.CallContext(ctxwt, &proof, "eth_getProof", address, nil, toBlockNumArg(b))
+	if err != nil {
+		return common.Hash{}, err
+	}
+
+	return proof.StorageHash, nil
 }
 
 func (m *myClient) FilterLogs(query ethereum.FilterQuery) (Logs, error) {
@@ -140,8 +209,7 @@ func (m *myClient) FilterLogs(query ethereum.FilterQuery) (Logs, error) {
 }
 
 func (m *myClient) Close() {
-	//TODO implement me
-	panic("implement me")
+	m.rpc.Close()
 }
 
 type RPC interface {
@@ -157,7 +225,7 @@ type Logs struct {
 
 type EthClient interface {
 	BlockHeaderByNumber(*big.Int) (*types.Header, error)
-	LatestBlockNumber() (*types.Header, error)
+	LatestSafeBlockHeader() (*types.Header, error)
 	LatestFinalizedBlockHeader() (*types.Header, error)
 	BlockHeaderByHash(hash common.Hash) (*types.Header, error)
 	BlockHeadersByRange(*big.Int, *big.Int, uint) ([]types.Header, error)
@@ -167,11 +235,15 @@ type EthClient interface {
 	StorageHash(common.Address, *big.Int) (common.Hash, error)
 	FilterLogs(query ethereum.FilterQuery) (Logs, error)
 
+	DebugTraceAll(common.Address) ([]byte, error)
+
+	GetStorageAt(common.Hash) (storage.Storage, error)
+
 	Close()
 }
 
 func DialEthClient(ctx context.Context, rpcUrl string) (EthClient, error) {
-	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+	ctx, cancel := context.WithTimeout(ctx, defaultDialTimeout)
 	defer cancel()
 
 	rpcClient, err := rpc.DialContext(ctx, rpcUrl)
