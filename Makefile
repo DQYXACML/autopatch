@@ -1,6 +1,4 @@
-VRF_ABI_ARTIFACT := ./abis/DappLinkVRFManager.sol/DappLinkVRFManager.json
-BLS_FACTORY_ABI_ARTIFACT := ./abis/DappLinkVRFFactory.sol/DappLinkVRFFactory.json
-BLS_ABI_ARTIFACT := ./abis/BLSApkRegistry.sol/BLSApkRegistry.json
+StorageScan_ABI_ARTIFACT := ./abis/StorageScan.sol/StorageScan.json
 
 
 autopatch:
@@ -15,54 +13,20 @@ test:
 lint:
 	golangci-lint run ./...
 
-bindings: binding-vrf binding-bls binding-factory
-
+bindings: binding-vrf
 
 binding-vrf:
 	$(eval temp := $(shell mktemp))
 
-	cat $(VRF_ABI_ARTIFACT) \
+	cat $(StorageScan_ABI_ARTIFACT) \
     	| jq -r .bytecode.object > $(temp)
 
-	cat $(VRF_ABI_ARTIFACT) \
+	cat $(StorageScan_ABI_ARTIFACT) \
 		| jq .abi \
 		| abigen --pkg bindings \
 		--abi - \
-		--out bindings/dapplinkvrfmanager.go \
-		--type DappLinkVRFManager \
-		--bin $(temp)
-
-		rm $(temp)
-
-binding-bls:
-	$(eval temp := $(shell mktemp))
-
-	cat $(BLS_ABI_ARTIFACT) \
-    	| jq -r .bytecode.object > $(temp)
-
-	cat $(BLS_ABI_ARTIFACT) \
-		| jq .abi \
-		| abigen --pkg bindings \
-		--abi - \
-		--out bindings/blsapkregistry.go \
-		--type BLSApkRegistry \
-		--bin $(temp)
-
-		rm $(temp)
-
-
-binding-factory:
-	$(eval temp := $(shell mktemp))
-
-	cat $(BLS_FACTORY_ABI_ARTIFACT) \
-    	| jq -r .bytecode.object > $(temp)
-
-	cat $(BLS_FACTORY_ABI_ARTIFACT) \
-		| jq .abi \
-		| abigen --pkg bindings \
-		--abi - \
-		--out bindings/dapplinkvrffactory.go \
-		--type DappLinkVRFFactory \
+		--out bindings/storagescan.go \
+		--type StorageScan \
 		--bin $(temp)
 
 		rm $(temp)
@@ -72,7 +36,6 @@ binding-factory:
 	autopatch \
 	bindings \
 	binding-vrf \
-	binding-bls \
 	clean \
 	test \
 	lint
