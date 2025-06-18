@@ -1,6 +1,7 @@
 package synchronizer
 
 import (
+	"context"
 	"fmt"
 	"github.com/DQYXACML/autopatch/common/tasks"
 	"github.com/DQYXACML/autopatch/config"
@@ -14,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 	"math/big"
 	"os"
 	"time"
@@ -44,6 +46,7 @@ func NewSynchronizer(cfg *config.Config, db *database.DB, client node.EthClient)
 	var fromHeader *types.Header
 	if latestHeader != nil {
 		fromHeader = latestHeader.RLPHeader.Header()
+		log.Info("Header from DB", "header", fromHeader.Number)
 	} else if cfg.Chain.StartingHeight > 0 {
 		header, err := client.BlockHeaderByNumber(big.NewInt(int64(cfg.Chain.StartingHeight)))
 		if err != nil {
@@ -51,6 +54,7 @@ func NewSynchronizer(cfg *config.Config, db *database.DB, client node.EthClient)
 			return nil, err
 		}
 		fromHeader = header
+		log.Info("Header from env", "header", header.Number)
 	} else {
 		log.Info("no eth block indexed state")
 	}
@@ -68,10 +72,11 @@ func NewSynchronizer(cfg *config.Config, db *database.DB, client node.EthClient)
 
 func (syncer *Synchronizer) Start() error {
 	log.Info("Starting synchronizer")
-	tickerSyncer := time.NewTicker(time.Second * 1)
+	tickerSyncer := time.NewTicker(time.Second * 10)
 	syncer.tasks.Go(func() error {
 		for range tickerSyncer.C {
 			newHeaders, err := syncer.headerTraversal.NextHeaders(syncer.chainCfg.BlockStep)
+			log.Info("NewHeaders", "newHeaders", len(newHeaders))
 			if err != nil {
 				log.Error("error querying for header", "err", err)
 				continue
@@ -103,8 +108,8 @@ func (syncer *Synchronizer) processBatch(headers []types.Header) error {
 	if len(headers) == 0 {
 		return nil
 	}
-	firstHeader, lastHead := headers[0], headers[len(headers)-1]
-	log.Info("sync batch", "size", len(headers), "startBlock", firstHeader.Number, "endBlock", lastHead.Number)
+	firstHeader, lastHeader := headers[0], headers[len(headers)-1]
+	log.Info("sync batch", "size", len(headers), "startBlock", firstHeader.Number, "endBlock", lastHeader.Number)
 
 	headerMap := make(map[common.Hash]*types.Header, len(headers))
 	for i := range headers {
@@ -121,6 +126,10 @@ func (syncer *Synchronizer) processBatch(headers []types.Header) error {
 
 	log.Info("Protected address list", "addresses", addressList)
 
+	// 并发准备
+	const maxWorkers = 16
+	g, _ := errgroup.WithContext(context.Background())
+	sem := make(chan struct{}, maxWorkers)
 	// 存储header结构
 	blockHeaders := make([]common2.BlockHeader, 0, len(headers))
 	for i := range headers {
@@ -135,14 +144,36 @@ func (syncer *Synchronizer) processBatch(headers []types.Header) error {
 			RLPHeader:  (*utils.RLPHeader)(&headers[i]),
 		}
 		blockHeaders = append(blockHeaders, bHeader)
-		// 写StorageState入库
-		if err := syncer.parseStorage(&headers[i]); err != nil {
-			log.Error("parseStorage fail", "err", err)
-			return err
-		}
+		h := headers[i]
+		sem <- struct{}{}
+		// --- Storage ---
+		g.Go(func() error {
+			defer func() { <-sem }()
+			return syncer.parseStorage(&h)
+		})
+		// --- Tx ---
+		sem <- struct{}{}
+		g.Go(func() error {
+			defer func() { <-sem }()
+			return syncer.parseTx(addressList[0], &h)
+		})
+		//// 写StorageState入库
+		//log.Info("write StorageState to db", "header", headers[i].Number)
+		//if err := syncer.parseStorage(&headers[i]); err != nil {
+		//	log.Error("parseStorage fail", "err", err)
+		//	return err
+		//}
+		//// 写tx 入库
+		//log.Info("write tx to db", "txs", len(addressList), "blockNumber", headers[i].Number)
+		//if err := syncer.parseTx(addressList[0], &headers[i]); err != nil {
+		//	log.Error("parseTx fail", "err", err)
+		//	return err
+		//}
+		return g.Wait()
 	}
 
 	// 写blockHeader入库
+	log.Info("Process Batch Write blockHeaders in DB")
 	if err := syncer.db.Transaction(func(tx *database.DB) error {
 		if err := tx.Blocks.StoreBlockHeaders(blockHeaders); err != nil {
 			return err
@@ -153,6 +184,32 @@ func (syncer *Synchronizer) processBatch(headers []types.Header) error {
 		return err
 	}
 
+	return nil
+}
+
+func (syncer *Synchronizer) parseTx(addr common.Address, header *types.Header) error {
+	txs, err := syncer.ethClient.TransactionsToAtBlock(addr, header.Number)
+	log.Info("parseTx log", "txs", len(txs))
+	if err != nil {
+		return err
+	}
+	protectedTxs := make([]worker.ProtectedTx, 0, len(txs))
+	for _, tx := range txs {
+		protectedTx := worker.ProtectedTx{
+			GUID:             uuid.New(),
+			BlockHash:        header.Hash(),
+			BlockNumber:      header.Number,
+			Hash:             tx.Hash(),
+			ProtectedAddress: addr,
+			InputData:        tx.Data(),
+		}
+		protectedTxs = append(protectedTxs, protectedTx)
+	}
+	err = syncer.db.ProtectedTx.StoreProtectedTx(protectedTxs, uint64(len(protectedTxs)))
+	if err != nil {
+		log.Error("StoreProtectedTx fail", "err", err)
+		return err
+	}
 	return nil
 }
 

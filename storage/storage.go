@@ -97,8 +97,34 @@ func (sp *StorageParser) ProcessStorage() error {
 		log.Info("Protected Storage Key-Value", "key", storage.StorageKey, "value", storage.StorageValue)
 	}
 	// 读取db里的不变量，结合storage和参数，判断不变量是否被打破
-	
+	protectedStorageWithHeaders, err := sp.db.ProtectedStorage.QueryProtectedStorageWithHeader(common2.HexToAddress("0xCcdaC991C3AB71dA4bB2510E79eA4B90e41128CB"), latestBlockHeader.Number)
+	if err != nil {
+		return err
+	}
+	for _, storage := range protectedStorageWithHeaders {
+
+		log.Info("protected Storage With Headers Key-Value", "key", storage.StorageKey, "value", storage.StorageValue)
+	}
 	// 如果被打破，进行相应的处理
+	// 获取打破前后的区块高度.
+	beforeAttackHeaderNumber, attackHeaderNumber := new(big.Int).Sub(latestBlockHeader.Number, big.NewInt(1)), latestBlockHeader.Number
+	log.Info("Attack Header Number", "beforeAttackHeaderNumber", beforeAttackHeaderNumber, "afterAttackHeaderNumber", attackHeaderNumber)
+	// 根据区块高度、保护合约的地址，查询获取打破前后的交易
+	attackTxs, err := sp.db.ProtectedTx.QueryProtectedTxWithHeaderAndAddress(common2.HexToAddress("0xCcdaC991C3AB71dA4bB2510E79eA4B90e41128CB"), attackHeaderNumber)
+	if err != nil {
+		log.Error("query protected tx with header and address fail", "err", err)
+		return err
+	}
+	if len(attackTxs) == 1 {
+		attacktx := attackTxs[0] // 获取攻击交易
+		// 从交易中获取一些特征：
+		log.Info("attack tx", "attackTx", attacktx)
+	} else {
+		for _, tx := range attackTxs {
+			log.Info("Attack Tx", "tx", tx)
+		}
+	}
+
 	return nil
 }
 

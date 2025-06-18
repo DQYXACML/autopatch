@@ -95,7 +95,7 @@ var (
 		Name:    "event-loop-interval",
 		Usage:   "The interval of event parse",
 		EnvVars: prefixEnvVars("EVENT_LOOP_INTERVAL"),
-		Value:   time.Second * 5,
+		Value:   time.Second * 10,
 	}
 	CallIntervalFlag = &cli.DurationFlag{
 		Name:    "call-loop-interval",

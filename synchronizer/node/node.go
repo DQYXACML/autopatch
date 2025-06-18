@@ -25,6 +25,133 @@ type myClient struct {
 	rpc RPC
 }
 
+func (m *myClient) TraceCallPath(hash common.Hash) (*callFrame, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+
+	var root callFrame
+	cfg := map[string]any{"tracer": "callTracer"}
+	if err := m.rpc.CallContext(ctx, &root, "debug_traceTransaction", hash, cfg); err != nil {
+		return nil, err
+	}
+	return &root, nil
+}
+
+type structLog struct {
+	Pc      uint64 `json:"pc"`
+	Op      string `json:"op"`
+	Gas     uint64 `json:"gas"`
+	GasCost uint64 `json:"gasCost"`
+	Depth   int    `json:"depth"`
+}
+
+type vmTraceResult struct {
+	StructLogs []structLog `json:"structLogs"`
+}
+
+func (m *myClient) TraceOpcodes(hash common.Hash) ([]map[string]interface{}, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+
+	var res vmTraceResult
+	// 不指定 tracer，Geth 默认返回 structLogs
+	if err := m.rpc.CallContext(ctx, &res, "debug_traceTransaction", hash); err != nil {
+		return nil, err
+	}
+
+	ops := make([]map[string]interface{}, len(res.StructLogs))
+	for i, slog := range res.StructLogs {
+		ops[i] = make(map[string]interface{})
+		ops[i]["op"] = slog.Op
+		ops[i]["pc"] = slog.Pc
+	}
+	return ops, nil
+}
+
+func (m *myClient) TransactionsToAtBlock(addr common.Address, blockNumber *big.Int) ([]*types.Transaction, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+	var block *types.Block
+	if err := m.rpc.CallContext(
+		ctx,
+		&block,
+		"eth_getBlockByNumber",
+		toBlockNumArg(blockNumber), // 参数 1：区块号
+		true,                       // 参数 2：返回完整交易对象
+	); err != nil {
+		return nil, err
+	}
+	if block == nil {
+		return nil, fmt.Errorf("block %s not found", blockNumber.String())
+	}
+
+	/* -------- 2. 遍历过滤 To 地址 -------- */
+	var hits []*types.Transaction
+	for _, tx := range block.Transactions() {
+		if to := tx.To(); to != nil && *to == addr {
+			hits = append(hits, tx)
+		}
+	}
+
+	return hits, nil
+}
+
+func (m *myClient) TxReceiptByHash(hash common.Hash) (*types.Receipt, error) {
+	ctxwt, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+
+	var txReceipt *types.Receipt
+	err := m.rpc.CallContext(ctxwt, &txReceipt, "eth_getTransactionReceipt", hash)
+	if err != nil {
+		return nil, err
+	} else if txReceipt == nil {
+		return nil, ethereum.NotFound
+	}
+
+	return txReceipt, nil
+}
+
+func (m *myClient) TxCountByAddress(address common.Address) (hexutil.Uint64, error) {
+	ctxwt, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+	var nonce hexutil.Uint64
+	err := m.rpc.CallContext(ctxwt, &nonce, "eth_getTransactionCount", address, "latest")
+	if err != nil {
+		log.Error("Call eth_getTransactionCount method fail", "err", err)
+		return 0, err
+	}
+	log.Info("get nonce by address success", "nonce", nonce)
+	return nonce, err
+}
+
+func (m *myClient) DebugTraceTransaction(hash common.Hash) ([]byte, error) {
+	log.Info("DebugTraceTransaction called", "hash: ", hash.Hex())
+	ctxwt, _ := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	err := m.rpc.CallContext(ctxwt, nil, "debug_traceTransaction", hash)
+	if err != nil {
+		return nil, err
+	}
+	var traceResult interface{}
+	tracerCfg := map[string]interface{}{
+		"tracer": "callTracer",
+	}
+	err = m.rpc.CallContext(
+		ctxwt,
+		&traceResult,
+		"debug_traceTransaction",
+		hash,
+		tracerCfg,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	//log.Info("traceResult", "result: ", traceResult)
+	fmt.Println("traceResult: ", traceResult)
+
+	return nil, nil
+}
+
 func (m *myClient) DebugTraceAll(address common.Address) ([]byte, error) {
 	log.Info("DebugTraceAll called", "address: ", address.Hex())
 	return nil, fmt.Errorf("DebugTraceAll is not implemented")
@@ -156,6 +283,8 @@ func (m *myClient) TxByHash(hash common.Hash) (*types.Transaction, error) {
 		return nil, ethereum.NotFound
 	}
 
+	log.Info("Transaction Data is: ", tx.Data())
+
 	return tx, nil
 }
 
@@ -223,6 +352,17 @@ type Logs struct {
 	ToBlockHeader *types.Header
 }
 
+type callFrame struct {
+	Type    string      `json:"type"`
+	From    string      `json:"from"`
+	To      string      `json:"to"`
+	Input   string      `json:"input"`
+	Calls   []callFrame `json:"calls,omitempty"`
+	Gas     string      `json:"gas"`
+	GasUsed string      `json:"gas_used"`
+	Value   string      `json:"value"`
+}
+
 type EthClient interface {
 	BlockHeaderByNumber(*big.Int) (*types.Header, error)
 	LatestSafeBlockHeader() (*types.Header, error)
@@ -231,11 +371,19 @@ type EthClient interface {
 	BlockHeadersByRange(*big.Int, *big.Int, uint) ([]types.Header, error)
 
 	TxByHash(hash common.Hash) (*types.Transaction, error)
+	TxReceiptByHash(common.Hash) (*types.Receipt, error)
+	TransactionsToAtBlock(addr common.Address, blockNumber *big.Int) ([]*types.Transaction, error)
 
 	StorageHash(common.Address, *big.Int) (common.Hash, error)
 	FilterLogs(query ethereum.FilterQuery) (Logs, error)
 
+	TxCountByAddress(common.Address) (hexutil.Uint64, error)
+
 	DebugTraceAll(common.Address) ([]byte, error)
+	DebugTraceTransaction(hash common.Hash) ([]byte, error)
+
+	TraceCallPath(hash common.Hash) (*callFrame, error)
+	TraceOpcodes(hash common.Hash) ([]map[string]interface{}, error)
 
 	GetStorageAt(common.Hash) (storage.Storage, error)
 

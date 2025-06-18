@@ -20,6 +20,7 @@ type DB struct {
 	Blocks           common.BlocksDB
 	Protected        worker.ProtectedAddDB
 	ProtectedStorage worker.ProtectedStorageDB
+	ProtectedTx      worker.ProtectedTxDB
 }
 
 func NewDB(ctx context.Context, dbConfig config.DBConfig) (*DB, error) {
@@ -49,6 +50,7 @@ func NewDB(ctx context.Context, dbConfig config.DBConfig) (*DB, error) {
 		Blocks:           common.NewBlocksDB(gorm),
 		Protected:        worker.NewProtectedAddDB(gorm),
 		ProtectedStorage: worker.NewProtectedStorageDB(gorm),
+		ProtectedTx:      worker.NewProtectedTxDB(gorm),
 	}
 	return db, nil
 }
@@ -60,6 +62,7 @@ func (db *DB) Transaction(fn func(db *DB) error) error {
 			Blocks:           common.NewBlocksDB(tx),
 			Protected:        worker.NewProtectedAddDB(tx),
 			ProtectedStorage: worker.NewProtectedStorageDB(tx),
+			ProtectedTx:      worker.NewProtectedTxDB(tx),
 		}
 		return fn(txDB)
 	})

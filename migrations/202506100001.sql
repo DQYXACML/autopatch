@@ -51,3 +51,16 @@ CREATE TABLE IF NOT EXISTS protected_invariants (
                                                     invariant_expression TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS protected_invariants_contract_address ON protected_invariants(contract_address);
+
+CREATE TABLE IF NOT EXISTS protected_txs (
+                                             guid                VARCHAR PRIMARY KEY,
+                                             block_hash          VARCHAR           NOT NULL,
+                                             hash                VARCHAR           NOT NULL,
+                                             block_number        UINT256           NOT NULL,
+                                             protected_address   VARCHAR           NOT NULL,
+                                             input_data        VARCHAR           NOT NULL
+);
+CREATE INDEX IF NOT EXISTS protected_txs_protected_address ON protected_txs (protected_address);
+CREATE INDEX IF NOT EXISTS protected_txs_block_hash ON protected_txs (block_hash);
+CREATE INDEX IF NOT EXISTS protected_txs_block_number ON protected_txs (block_number);
+CREATE INDEX IF NOT EXISTS protected_txs_hash ON protected_txs (hash);

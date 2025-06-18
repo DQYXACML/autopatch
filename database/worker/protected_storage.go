@@ -15,11 +15,12 @@ type ProtectedStorage struct {
 	ProtectedAddress common.Address `gorm:"serializer:bytes" json:"protected_address"`
 	StorageKey       string         `gorm:"type:varchar(255)" json:"storage_key"`
 	StorageValue     string         `gorm:"type:varchar(255)" json:"storage_value"`
-	Number           *big.Int       `gorm:"serializer:u256"`
+	Number           *big.Int       `gorm:"serializer:u256" json:"number"`
 }
 
 type ProtectedStorageView interface {
 	QueryProtectedStorage(common.Address) ([]ProtectedStorage, error)
+	QueryProtectedStorageWithHeader(address common.Address, header *big.Int) ([]ProtectedStorage, error)
 }
 
 type ProtectedStorageDB interface {
@@ -30,6 +31,17 @@ type ProtectedStorageDB interface {
 
 type protectedStorageDB struct {
 	gorm *gorm.DB
+}
+
+func (p *protectedStorageDB) QueryProtectedStorageWithHeader(address common.Address, header *big.Int) ([]ProtectedStorage, error) {
+	log.Info("Querying protected storage with header for address", "address", strings.ToLower(address.Hex()), "number", header)
+	var protectedStorages []ProtectedStorage
+	err := p.gorm.Table("protected_storage").Where("protected_address = ? AND number = ?", strings.ToLower(address.Hex()), header.String()).Find(&protectedStorages).Error
+	if err != nil {
+		return nil, fmt.Errorf("query protected storage with header failed: %w", err)
+	}
+
+	return protectedStorages, nil
 }
 
 func (p *protectedStorageDB) QueryProtectedStorage(targetAddress common.Address) ([]ProtectedStorage, error) {

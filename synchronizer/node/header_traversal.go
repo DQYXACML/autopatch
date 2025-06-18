@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/DQYXACML/autopatch/common/bigint"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/log"
 	"math/big"
 )
 
@@ -51,6 +52,7 @@ func (f *HeaderTraversal) NextHeaders(maxSize uint64) ([]types.Header, error) {
 	}
 
 	endHeight := new(big.Int).Sub(latestHeader.Number, f.blockConfirmationDepth)
+	log.Info("endHeight after sub", "endHeight", endHeight, "latestHeader", latestHeader.Number, "blockConfirmationDepth", f.blockConfirmationDepth, "lastTraversedHeader Number", f.lastTraversedHeader.Number)
 	if endHeight.Sign() < 0 {
 		return nil, nil
 	}
@@ -70,18 +72,20 @@ func (f *HeaderTraversal) NextHeaders(maxSize uint64) ([]types.Header, error) {
 	}
 
 	endHeight = bigint.Clamp(nextHeight, endHeight, maxSize)
+	log.Info("endHeight after clamp", "endHeight", endHeight, "nextHeight", nextHeight, "maxSize", maxSize)
 	headers, err := f.ethClient.BlockHeadersByRange(nextHeight, endHeight, f.chainId)
 	if err != nil {
 		return nil, fmt.Errorf("error querying blocks by range: %w", err)
 	}
 
 	numHeaders := len(headers)
+	log.Info("number of headers fetched", "numHeaders", numHeaders, "nextHeight", nextHeight, "endHeight", endHeight)
 	if numHeaders == 0 {
 		return nil, nil
 	} else if f.lastTraversedHeader != nil && headers[0].ParentHash != f.lastTraversedHeader.Hash() {
-		fmt.Println(f.lastTraversedHeader.Number)
-		fmt.Println(headers[0].Number)
-		fmt.Println(len(headers))
+		//fmt.Println(f.lastTraversedHeader.Number)
+		//fmt.Println(headers[0].Number)
+		//fmt.Println(len(headers))
 		return nil, ErrHeaderTraversalAndProviderMismatchedState
 	}
 	f.lastTraversedHeader = &headers[numHeaders-1]
