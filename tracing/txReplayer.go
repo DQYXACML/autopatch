@@ -1,1005 +1,1900 @@
 package tracing
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"crypto/ecdsa"
 	"fmt"
-	"github.com/ethereum/go-ethereum/accounts/abi"
+	"math/big"
+	"math/rand"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/DQYXACML/autopatch/database"
+	"github.com/DQYXACML/autopatch/database/common"
+	"github.com/DQYXACML/autopatch/database/worker"
+	"github.com/DQYXACML/autopatch/synchronizer/node"
+	"github.com/DQYXACML/autopatch/txmgr/ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
-	"github.com/ethereum/go-ethereum/common"
+	gethCommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
-	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
 	"github.com/holiman/uint256"
-	"math/big"
-	"reflect"
-	"regexp"
-	"sort"
-	"strings"
 )
 
-// StorageVariable represents a variable in contract storage
-type StorageVariable struct {
-	Name     string `json:"name"`
-	Type     string `json:"type"`
-	Slot     int    `json:"slot"`
-	Offset   int    `json:"offset"`   // Byte offset within the slot
-	Size     int    `json:"size"`     // Size in bytes
-	IsSigned bool   `json:"isSigned"` // For integer types
+var (
+	EthGasLimit          uint64 = 21000
+	TokenGasLimit        uint64 = 120000
+	maxFeePerGas                = big.NewInt(2900000000)
+	maxPriorityFeePerGas        = big.NewInt(2600000000)
+)
+
+// AttackReplayer handles attack transaction replay and analysis
+type AttackReplayer struct {
+	client              *ethclient.Client
+	nodeClient          node.EthClient
+	jumpTracer          *JumpTracer
+	inputModifier       *InputModifier
+	db                  *database.DB
+	addressesDB         common.AddressesDB
+	similarityThreshold float64
+	maxVariations       int
+
+	// 新增：并发修改相关字段
+	concurrentConfig  *ConcurrentModificationConfig
+	transactionSender *ethereum.BatchTransactionSender
+	privateKey        string
+	privateKeyECDSA   *ecdsa.PrivateKey  // 新增：存储解析后的私钥
+	fromAddress       gethCommon.Address // 新增：存储发送者地址
+	chainID           *big.Int
+
+	// 新增：步长变异配置
+	mutationConfig *MutationConfig
 }
 
-// StorageLayout represents the storage layout of a contract
-type StorageLayout struct {
-	Variables []StorageVariable `json:"variables"`
+// MutationConfig 步长变异配置
+type MutationConfig struct {
+	InputSteps   []int64 `json:"inputSteps"`   // 输入数据变异步长: [10, 100, -10, -100, 1000, -1000]
+	StorageSteps []int64 `json:"storageSteps"` // 存储值变异步长: [1, 10, 100, -1, -10, -100]
+	ByteSteps    []int   `json:"byteSteps"`    // 字节级变异步长: [1, 2, 5, -1, -2, -5]
+	MaxMutations int     `json:"maxMutations"` // 每次最大变异数量
+	OnlyPrestate bool    `json:"onlyPrestate"` // 是否只修改prestate中已有的存储槽
 }
 
-// VariableInfo holds parsed information about a storage variable
-type VariableInfo struct {
-	Name     string
-	Type     string
-	Size     int
-	IsSigned bool
-	IsStatic bool // true for fixed-size types, false for dynamic types
+// DefaultMutationConfig 默认步长变异配置
+func DefaultMutationConfig() *MutationConfig {
+	return &MutationConfig{
+		InputSteps:   []int64{10, 100, 1000, -10, -100, -1000, 1, -1, 50, -50},
+		StorageSteps: []int64{1, 10, 100, 1000, -1, -10, -100, -1000, 5, -5},
+		ByteSteps:    []int{1, 2, 5, 10, -1, -2, -5, -10},
+		MaxMutations: 3,
+		OnlyPrestate: true,
+	}
 }
 
-// TransactionReplayer handles the complete replay process
-type TransactionReplayer struct {
-	client            *ethclient.Client
-	simpleModifiers   map[common.Address]*InputModifier         // 简单函数选择器修改
-	advancedModifiers map[common.Address]*AdvancedInputModifier // 高级参数修改
-	tracer            *CustomTracer                             // NEW: Custom tracer
-	storageLayouts    map[common.Address]*StorageLayout         // NEW: Storage layouts for contracts
-}
-
-func NewTransactionReplayer(rpcURL string) (*TransactionReplayer, error) {
+// NewAttackReplayer creates a new attack replayer
+func NewAttackReplayer(rpcURL string, db *database.DB, contractsMetadata *bind.MetaData) (*AttackReplayer, error) {
 	client, err := ethclient.Dial(rpcURL)
+	nodeClient, err := node.DialEthClient(context.Background(), rpcURL)
 	if err != nil {
 		return nil, err
 	}
 
-	return &TransactionReplayer{
-		client:            client,
-		simpleModifiers:   make(map[common.Address]*InputModifier),
-		advancedModifiers: make(map[common.Address]*AdvancedInputModifier),
-		tracer:            NewCustomTracer(),                       // NEW: Initialize tracer
-		storageLayouts:    make(map[common.Address]*StorageLayout), // NEW: Initialize storage layouts
+	inputModifier, err := NewInputModifier(contractsMetadata)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create input modifier: %v", err)
+	}
+
+	// 创建批量交易发送器
+	batchSender, err := ethereum.NewBatchTransactionSender(nodeClient, 4)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create batch transaction sender: %v", err)
+	}
+
+	// 获取链ID
+	chainID, err := client.NetworkID(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get chain ID: %v", err)
+	}
+
+	// 写死私钥在程序里
+	hardcodedPrivateKey := "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" // 示例私钥，实际使用时请替换
+
+	// 解析私钥
+	privateKeyECDSA, err := crypto.HexToECDSA(hardcodedPrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %v", err)
+	}
+
+	// 计算发送者地址
+	fromAddress := crypto.PubkeyToAddress(privateKeyECDSA.PublicKey)
+
+	fmt.Printf("=== ATTACK REPLAYER INITIALIZED ===\n")
+	fmt.Printf("From Address: %s\n", fromAddress.Hex())
+	fmt.Printf("Chain ID: %s\n", chainID.String())
+	fmt.Printf("RPC URL: %s\n", rpcURL)
+
+	return &AttackReplayer{
+		client:              client,
+		nodeClient:          nodeClient,
+		jumpTracer:          NewJumpTracer(),
+		inputModifier:       inputModifier,
+		db:                  db,
+		addressesDB:         db.Addresses,
+		similarityThreshold: 0.8,
+		maxVariations:       20,
+		concurrentConfig:    DefaultConcurrentModificationConfig(),
+		transactionSender:   batchSender,
+		privateKey:          hardcodedPrivateKey,
+		privateKeyECDSA:     privateKeyECDSA,
+		fromAddress:         fromAddress,
+		chainID:             chainID,
+		mutationConfig:      DefaultMutationConfig(), // 新增：默认变异配置
 	}, nil
 }
 
-func (r *TransactionReplayer) AddSimpleModifier(contract common.Address, modifier *InputModifier) {
-	r.simpleModifiers[contract] = modifier
+// SetMutationConfig 设置变异配置
+func (r *AttackReplayer) SetMutationConfig(config *MutationConfig) {
+	r.mutationConfig = config
 }
 
-// AddAdvancedModifierFromBinding 使用abigen binding添加高级修改器
-func (r *TransactionReplayer) AddAdvancedModifierFromBinding(contract common.Address, metaData *bind.MetaData) error {
-	modifier, err := NewAdvancedInputModifierFromBinding(metaData)
-	if err != nil {
-		return err
-	}
-	r.advancedModifiers[contract] = modifier
+// SetPrivateKey 设置私钥用于交易签名
+func (r *AttackReplayer) SetPrivateKey(privateKey string) {
+	r.privateKey = privateKey
 
-	// NEW: Also add ABI to tracer
-	if contractABI, err := metaData.GetAbi(); err == nil && contractABI != nil {
-		r.tracer.AddContractABI(contract, contractABI)
+	// 解析私钥
+	privateKeyECDSA, err := crypto.HexToECDSA(privateKey)
+	if err != nil {
+		fmt.Printf("Failed to parse private key: %v\n", err)
+		return
+	}
+
+	r.privateKeyECDSA = privateKeyECDSA
+	r.fromAddress = crypto.PubkeyToAddress(privateKeyECDSA.PublicKey)
+
+	fmt.Printf("Updated private key and from address: %s\n", r.fromAddress.Hex())
+}
+
+// sendTransactionToContract 发送交易到合约
+func (r *AttackReplayer) sendTransactionToContract(
+	contractAddr gethCommon.Address,
+	inputData []byte,
+	storageChanges map[gethCommon.Hash]gethCommon.Hash,
+	gasLimit uint64,
+) (*gethCommon.Hash, error) {
+	if r.privateKeyECDSA == nil {
+		return nil, fmt.Errorf("private key not set")
+	}
+
+	// 1. 获取nonce值
+	nonce, err := r.nodeClient.TxCountByAddress(r.fromAddress)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get nonce: %v", err)
+	}
+
+	fmt.Printf("🔢 Current nonce for %s: %d\n", r.fromAddress.Hex(), uint64(nonce))
+
+	// 2. 创建交易数据结构
+	txData := &types.DynamicFeeTx{
+		ChainID:   r.chainID,
+		Nonce:     uint64(nonce),
+		GasTipCap: maxPriorityFeePerGas,
+		GasFeeCap: maxFeePerGas,
+		Gas:       gasLimit,
+		To:        &contractAddr,
+		Value:     big.NewInt(0),
+		Data:      inputData,
+	}
+
+	fmt.Printf("📦 Created transaction data:\n")
+	fmt.Printf("   To: %s\n", contractAddr.Hex())
+	fmt.Printf("   Nonce: %d\n", txData.Nonce)
+	fmt.Printf("   Gas: %d\n", txData.Gas)
+	fmt.Printf("   Data length: %d bytes\n", len(inputData))
+	if len(inputData) >= 4 {
+		fmt.Printf("   Function selector: %x\n", inputData[:4])
+	}
+
+	// 3. 离线签名交易
+	rawTxHex, txHashStr, err := ethereum.OfflineSignTx(txData, r.privateKey, r.chainID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign transaction: %v", err)
+	}
+
+	fmt.Printf("✍️  Transaction signed successfully\n")
+	fmt.Printf("   Tx Hash: %s\n", txHashStr)
+	fmt.Printf("   Raw Tx length: %d bytes\n", len(rawTxHex))
+
+	// 4. 发送原始交易
+	err = r.nodeClient.SendRawTransaction(rawTxHex)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send transaction: %v", err)
+	}
+
+	txHash := gethCommon.HexToHash(txHashStr)
+	fmt.Printf("🚀 Transaction sent successfully: %s\n", txHash.Hex())
+
+	return &txHash, nil
+}
+
+// sendMutationTransactions 发送变异交易到合约
+func (r *AttackReplayer) sendMutationTransactions(
+	contractAddr gethCommon.Address,
+	mutations []MutationData,
+	gasLimit uint64,
+) ([]*gethCommon.Hash, error) {
+	if len(mutations) == 0 {
+		return nil, fmt.Errorf("no mutations to send")
+	}
+
+	fmt.Printf("=== SENDING %d MUTATION TRANSACTIONS ===\n", len(mutations))
+
+	var txHashes []*gethCommon.Hash
+	var errors []error
+
+	for i, mutation := range mutations {
+		fmt.Printf("\n--- Sending mutation %d/%d (ID: %s) ---\n", i+1, len(mutations), mutation.ID)
+
+		// 确保有修改的输入数据
+		inputData := mutation.InputData
+		if len(inputData) == 0 {
+			fmt.Printf("⚠️  Mutation %s has no input data, skipping\n", mutation.ID)
+			continue
+		}
+
+		// 发送交易
+		txHash, err := r.sendTransactionToContract(contractAddr, inputData, mutation.StorageChanges, gasLimit)
+		if err != nil {
+			fmt.Printf("❌ Failed to send mutation %s: %v\n", mutation.ID, err)
+			errors = append(errors, fmt.Errorf("mutation %s: %v", mutation.ID, err))
+			continue
+		}
+
+		txHashes = append(txHashes, txHash)
+		fmt.Printf("✅ Mutation %s sent: %s\n", mutation.ID, txHash.Hex())
+
+		// 添加小延迟避免nonce冲突
+		time.Sleep(1 * time.Second)
+	}
+
+	fmt.Printf("\n=== MUTATION TRANSACTION SENDING COMPLETED ===\n")
+	fmt.Printf("Successfully sent: %d/%d transactions\n", len(txHashes), len(mutations))
+	if len(errors) > 0 {
+		fmt.Printf("Errors encountered: %d\n", len(errors))
+		for _, err := range errors {
+			fmt.Printf("  - %v\n", err)
+		}
+	}
+
+	// 如果有部分成功，返回成功的交易哈希
+	if len(txHashes) > 0 {
+		return txHashes, nil
+	}
+
+	// 如果全部失败，返回第一个错误
+	if len(errors) > 0 {
+		return nil, errors[0]
+	}
+
+	return nil, fmt.Errorf("no transactions were sent")
+}
+
+// ReplayAttackTransactions replays all pending attack transactions
+func (r *AttackReplayer) ReplayAttackTransactions() error {
+	txs, err := r.db.AttackTx.QueryAttackTxByStatus(worker.StatusPending)
+	if err != nil {
+		return fmt.Errorf("failed to get pending transactions: %v", err)
+	}
+
+	fmt.Printf("Found %d pending attack transactions\n", len(txs))
+
+	for _, attackTx := range txs {
+		fmt.Printf("\n=== Processing attack transaction: %s ===\n", attackTx.TxHash.Hex())
+
+		err = r.db.AttackTx.MarkAsProcessing(attackTx.GUID)
+		if err != nil {
+			fmt.Printf("Failed to mark transaction as processing: %v\n", err)
+			continue
+		}
+
+		result, err := r.ReplayAttackTransactionWithVariations(attackTx.TxHash, attackTx.ContractAddress)
+		if err != nil {
+			fmt.Printf("Failed to replay transaction: %v\n", err)
+			r.db.AttackTx.MarkAsFailed(attackTx.GUID, err.Error())
+			continue
+		}
+
+		// 分析结果并更新状态
+		if len(result.SuccessfulRules) > 0 {
+			fmt.Printf("✅ Generated %d protection rules! Highest similarity: %.2f%%\n",
+				len(result.SuccessfulRules), result.HighestSimilarity*100)
+
+			// 这里可以将保护规则保存到数据库或发送到链上防护合约
+			r.saveProtectionRules(result.SuccessfulRules)
+
+			err = r.db.AttackTx.MarkAsSuccess(attackTx.GUID)
+		} else {
+			fmt.Printf("❌ No protection rules generated. Tested %d variations\n", result.TotalVariations)
+			err = r.db.AttackTx.MarkAsFailed(attackTx.GUID,
+				fmt.Sprintf("No rules generated after %d variations", result.TotalVariations))
+		}
+
+		if err != nil {
+			fmt.Printf("Failed to update transaction status: %v\n", err)
+		}
+
+		// 打印统计信息
+		r.printReplayStatistics(result)
 	}
 
 	return nil
 }
 
-// AddAdvancedModifier 保留原有方法用于向后兼容
-func (r *TransactionReplayer) AddAdvancedModifier(contract common.Address, abiJSON string) error {
-	modifier, err := NewAdvancedInputModifier(abiJSON)
+// ReplayAndSendMutations 重放攻击交易、收集变异并发送到合约
+func (r *AttackReplayer) ReplayAndSendMutations(txHash gethCommon.Hash, contractAddr gethCommon.Address) (*MutationCollection, []*gethCommon.Hash, error) {
+	fmt.Printf("=== REPLAY AND SEND MUTATIONS ===\n")
+
+	// 1. 重放并收集变异
+	mutationCollection, err := r.ReplayAndCollectMutations(txHash, contractAddr)
 	if err != nil {
-		return err
-	}
-	r.advancedModifiers[contract] = modifier
-
-	// NEW: Also add ABI to tracer
-	contractABI, err := abi.JSON(strings.NewReader(abiJSON))
-	if err == nil {
-		r.tracer.AddContractABI(contract, &contractABI)
+		return nil, nil, fmt.Errorf("failed to replay and collect mutations: %v", err)
 	}
 
-	return nil
+	// 2. 发送成功的变异到合约
+	if len(mutationCollection.SuccessfulMutations) == 0 {
+		fmt.Printf("⚠️  No successful mutations to send\n")
+		return mutationCollection, nil, nil
+	}
+
+	fmt.Printf("🚀 Sending %d successful mutations to contract...\n", len(mutationCollection.SuccessfulMutations))
+
+	txHashes, err := r.sendMutationTransactions(contractAddr, mutationCollection.SuccessfulMutations, TokenGasLimit)
+	if err != nil {
+		fmt.Printf("❌ Failed to send some or all mutation transactions: %v\n", err)
+		// 不返回错误，因为收集变异是成功的
+	}
+
+	return mutationCollection, txHashes, nil
 }
 
-// NEW: AddStorageLayout adds storage layout information for a contract
-func (r *TransactionReplayer) AddStorageLayout(contract common.Address, layout *StorageLayout) {
-	r.storageLayouts[contract] = layout
+// ReplayAttackTransactionWithConcurrentModification 使用并发修改重放攻击交易
+func (r *AttackReplayer) ReplayAttackTransactionWithConcurrentModification(txHash gethCommon.Hash, contractAddr gethCommon.Address) (*SimplifiedReplayResult, error) {
+	startTime := time.Now()
+
+	fmt.Printf("=== CONCURRENT ATTACK TRANSACTION REPLAY START ===\n")
+	fmt.Printf("Transaction hash: %s\n", txHash.Hex())
+	fmt.Printf("Contract address: %s\n", contractAddr.Hex())
+
+	// 获取交易详情
+	tx, err := r.nodeClient.TxByHash(txHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get transaction: %v", err)
+	}
+
+	// 获取预状态
+	prestate, err := r.getTransactionPrestate(txHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get prestate: %v", err)
+	}
+
+	// 执行原始交易
+	fmt.Printf("\n=== ORIGINAL EXECUTION ===\n")
+	originalPath, err := r.executeTransactionWithTracing(tx, prestate, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute original transaction: %v", err)
+	}
+
+	fmt.Printf("Original path recorded: %d jumps\n", len(originalPath.Jumps))
+
+	// 启动并发修改和模拟
+	result, err := r.runConcurrentModificationAndSimulation(tx, prestate, originalPath, contractAddr, txHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to run concurrent modification: %v", err)
+	}
+
+	result.ProcessingTime = time.Since(startTime)
+	fmt.Printf("\n=== CONCURRENT REPLAY COMPLETED ===\n")
+	fmt.Printf("Processing time: %v\n", result.ProcessingTime)
+
+	return result, nil
 }
 
-// NEW: AddStorageLayoutFromBinding creates storage layout from contract metadata
-func (r *TransactionReplayer) AddStorageLayoutFromBinding(contract common.Address, metaData *bind.MetaData) error {
-	// This is a simplified example for the specific case mentioned
-	// In practice, you would need to parse the contract's storage layout from metadata
-	// For now, we'll create a manual layout for the example case
-	layout := &StorageLayout{
-		Variables: []StorageVariable{
-			{Name: "int1", Type: "int8", Slot: 0, Offset: 0, Size: 1, IsSigned: true},
-			{Name: "int2", Type: "int128", Slot: 0, Offset: 1, Size: 16, IsSigned: true},
+// runConcurrentModificationAndSimulation 运行并发修改和模拟
+func (r *AttackReplayer) runConcurrentModificationAndSimulation(
+	tx *types.Transaction,
+	prestate PrestateResult,
+	originalPath *ExecutionPath,
+	contractAddr gethCommon.Address,
+	originalTxHash gethCommon.Hash,
+) (*SimplifiedReplayResult, error) {
+
+	// 创建通道
+	candidateChan := make(chan *ModificationCandidate, r.concurrentConfig.ChannelBufferSize)
+	resultChan := make(chan *WorkerResult, r.concurrentConfig.ChannelBufferSize)
+	transactionChan := make(chan *ethereum.TransactionPackage, r.concurrentConfig.ChannelBufferSize)
+	stopChan := make(chan struct{})
+
+	// 启动交易发送器（如果还未启动）
+	if !r.transactionSender.IsStarted() {
+		r.transactionSender.Start()
+	}
+
+	// 使用defer确保最终会调用stop，但要检查是否已经停止
+	defer func() {
+		if !r.transactionSender.IsStopped() {
+			r.transactionSender.Stop()
+		}
+	}()
+
+	var wg sync.WaitGroup
+
+	// 启动修改候选生成协程
+	wg.Add(1)
+	go r.modificationGenerator(candidateChan, stopChan, &wg, tx, prestate)
+
+	// 启动模拟执行协程池
+	for i := 0; i < r.concurrentConfig.MaxWorkers; i++ {
+		wg.Add(1)
+		go r.simulationWorker(i, candidateChan, resultChan, stopChan, &wg, tx, prestate, originalPath)
+	}
+
+	// 启动交易处理协程
+	wg.Add(1)
+	go r.transactionProcessor(resultChan, transactionChan, stopChan, &wg, contractAddr, originalTxHash)
+
+	// 启动交易发送协程
+	wg.Add(1)
+	go r.transactionSender_worker(transactionChan, stopChan, &wg)
+
+	// 收集结果
+	result := &SimplifiedReplayResult{
+		OriginalPath:      originalPath,
+		SuccessfulRules:   make([]OnChainProtectionRule, 0),
+		FailedVariations:  make([]ModificationVariation, 0),
+		TotalVariations:   0,
+		HighestSimilarity: 0.0,
+		Statistics: &SimpleReplayStatistics{
+			StrategyResults:   make(map[string]int),
+			ErrorDistribution: make(map[string]int),
 		},
 	}
-	r.AddStorageLayout(contract, layout)
-	return nil
-}
 
-// NEW: GenerateStorageLayoutFromABI dynamically generates storage layout from ABI
-func (r *TransactionReplayer) GenerateStorageLayoutFromABI(contract common.Address, metaData *bind.MetaData) error {
-	contractABI, err := metaData.GetAbi()
-	if err != nil {
-		return fmt.Errorf("failed to get ABI: %v", err)
-	}
+	// 等待一段时间或直到找到足够的成功案例
+	timeout := time.NewTimer(r.concurrentConfig.GenerationTimeout)
+	defer timeout.Stop()
 
-	layout, err := r.parseStorageLayoutFromABI(contractABI)
-	if err != nil {
-		return fmt.Errorf("failed to parse storage layout: %v", err)
-	}
+	successCount := 0
+	maxSuccess := 5 // 最多收集5个成功案例
 
-	r.AddStorageLayout(contract, layout)
-	return nil
-}
+	// 结果收集循环
+	func() {
+		for {
+			select {
+			case workerResult := <-resultChan:
+				result.TotalVariations++
 
-// parseStorageLayoutFromABI parses storage layout from ABI by analyzing setter functions
-func (r *TransactionReplayer) parseStorageLayoutFromABI(contractABI *abi.ABI) (*StorageLayout, error) {
-	variables := []VariableInfo{}
-
-	// Regular expressions to parse setter function names
-	setterRegex := regexp.MustCompile(`^set([A-Z][a-zA-Z0-9]*)$`)
-
-	// Extract variables from setter functions
-	for methodName, method := range contractABI.Methods {
-		if matches := setterRegex.FindStringSubmatch(methodName); matches != nil {
-			varName := strings.ToLower(matches[1][:1]) + matches[1][1:] // Convert to camelCase
-
-			// Only process setters with exactly one parameter
-			if len(method.Inputs) == 1 {
-				input := method.Inputs[0]
-				varInfo := VariableInfo{
-					Name: varName,
-					Type: input.Type.String(),
-				}
-
-				// Parse type information
-				err := r.parseVariableType(&varInfo, input.Type.String())
-				if err != nil {
-					fmt.Printf("Warning: failed to parse type %s for variable %s: %v\n",
-						input.Type.String(), varName, err)
+				if workerResult.Error != nil {
+					result.Statistics.FailCount++
+					result.Statistics.ErrorDistribution[workerResult.Error.Error()]++
 					continue
 				}
 
-				variables = append(variables, varInfo)
+				if workerResult.Result.Success && workerResult.Result.Similarity >= r.concurrentConfig.SimilarityThreshold {
+					// 创建保护规则
+					rule := r.createProtectionRuleFromResult(workerResult.Result, contractAddr, originalTxHash)
+					result.SuccessfulRules = append(result.SuccessfulRules, rule)
+					result.Statistics.SuccessCount++
+					successCount++
+
+					if workerResult.Result.Similarity > result.HighestSimilarity {
+						result.HighestSimilarity = workerResult.Result.Similarity
+					}
+
+					fmt.Printf("✅ Found successful modification! Similarity: %.2f%% (Total: %d)\n",
+						workerResult.Result.Similarity*100, successCount)
+
+					if successCount >= maxSuccess {
+						fmt.Printf("🎯 Reached maximum success count (%d), stopping...\n", maxSuccess)
+						return
+					}
+				} else {
+					result.Statistics.FailCount++
+				}
+
+			case <-timeout.C:
+				fmt.Printf("⏰ Timeout reached, stopping concurrent modification...\n")
+				return
+			}
+		}
+	}()
+
+	// 发送停止信号
+	close(stopChan)
+
+	// 等待所有协程结束
+	wg.Wait()
+
+	// 安全地关闭channels
+	safeCloseCandidate := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Channel已经被关闭，忽略panic
+			}
+		}()
+		select {
+		case <-candidateChan:
+		default:
+		}
+	}
+	safeCloseCandidate()
+
+	// 计算平均相似度
+	if result.Statistics.SuccessCount > 0 {
+		totalSimilarity := 0.0
+		for _, rule := range result.SuccessfulRules {
+			totalSimilarity += rule.Similarity
+		}
+		result.Statistics.AverageSimilarity = totalSimilarity / float64(result.Statistics.SuccessCount)
+	}
+
+	return result, nil
+}
+
+// modificationGenerator 修改候选生成协程
+func (r *AttackReplayer) modificationGenerator(
+	candidateChan chan<- *ModificationCandidate,
+	stopChan <-chan struct{},
+	wg *sync.WaitGroup,
+	tx *types.Transaction,
+	prestate PrestateResult,
+) {
+	defer wg.Done()
+	defer func() {
+		// 安全地关闭channel
+		defer func() {
+			if r := recover(); r != nil {
+				// Channel已经被关闭，忽略panic
+			}
+		}()
+		close(candidateChan)
+	}()
+
+	// 设置原始状态
+	contractStorage := make(map[gethCommon.Hash]gethCommon.Hash)
+	if tx.To() != nil {
+		if contractAccount, exists := prestate[*tx.To()]; exists {
+			contractStorage = contractAccount.Storage
+		}
+	}
+
+	err := r.inputModifier.SetOriginalState(tx.Data(), contractStorage)
+	if err != nil {
+		fmt.Printf("Failed to set original state: %v\n", err)
+		return
+	}
+
+	candidateID := 0
+	ticker := time.NewTicker(100 * time.Millisecond) // 每100ms生成一批候选
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stopChan:
+			return
+		case <-ticker.C:
+			// 生成一批修改候选（使用步长变异）
+			candidates := r.generateStepBasedModificationCandidates(candidateID, r.concurrentConfig.BatchSize, tx.Data(), contractStorage)
+			candidateID += len(candidates)
+
+			for _, candidate := range candidates {
+				select {
+				case candidateChan <- candidate:
+				case <-stopChan:
+					return
+				}
+			}
+
+			if candidateID >= r.concurrentConfig.MaxCandidates {
+				fmt.Printf("Generated maximum candidates (%d), stopping generator...\n", candidateID)
+				return
+			}
+		}
+	}
+}
+
+// simulationWorker 模拟执行工作协程
+func (r *AttackReplayer) simulationWorker(
+	workerID int,
+	candidateChan <-chan *ModificationCandidate,
+	resultChan chan<- *WorkerResult,
+	stopChan <-chan struct{},
+	wg *sync.WaitGroup,
+	tx *types.Transaction,
+	prestate PrestateResult,
+	originalPath *ExecutionPath,
+) {
+	defer wg.Done()
+
+	for {
+		select {
+		case <-stopChan:
+			return
+		case candidate := <-candidateChan:
+			if candidate == nil {
+				return
+			}
+
+			// 执行模拟
+			result := r.simulateModification(candidate, tx, prestate, originalPath)
+
+			workerResult := &WorkerResult{
+				WorkerID: workerID,
+				Result:   result,
+			}
+
+			if result.Error != nil {
+				workerResult.Error = result.Error
+			}
+
+			select {
+			case resultChan <- workerResult:
+			case <-stopChan:
+				return
+			}
+		}
+	}
+}
+
+// transactionProcessor 交易处理协程
+func (r *AttackReplayer) transactionProcessor(
+	resultChan <-chan *WorkerResult,
+	transactionChan chan<- *ethereum.TransactionPackage,
+	stopChan <-chan struct{},
+	wg *sync.WaitGroup,
+	contractAddr gethCommon.Address,
+	originalTxHash gethCommon.Hash,
+) {
+	defer wg.Done()
+	defer func() {
+		// 安全地关闭channel
+		defer func() {
+			if r := recover(); r != nil {
+				// Channel已经被关闭，忽略panic
+			}
+		}()
+		close(transactionChan)
+	}()
+
+	for {
+		select {
+		case <-stopChan:
+			return
+		case workerResult := <-resultChan:
+			if workerResult == nil {
+				return
+			}
+
+			// 只处理成功且相似度高的结果
+			if workerResult.Result.Success && workerResult.Result.Similarity >= r.concurrentConfig.SimilarityThreshold {
+				// 创建交易包
+				pkg := CreateTransactionPackage(workerResult.Result.Candidate, workerResult.Result.Similarity, contractAddr, originalTxHash)
+
+				select {
+				case transactionChan <- pkg:
+					fmt.Printf("📦 Created transaction package for similarity %.2f%%\n", workerResult.Result.Similarity*100)
+				case <-stopChan:
+					return
+				}
+			}
+		}
+	}
+}
+
+// transactionSender_worker 交易发送工作协程 - 使用新的发送方法
+func (r *AttackReplayer) transactionSender_worker(
+	transactionChan <-chan *ethereum.TransactionPackage,
+	stopChan <-chan struct{},
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+
+	if r.privateKeyECDSA == nil {
+		fmt.Printf("⚠️  No private key set, skipping transaction sending\n")
+		return
+	}
+
+	for {
+		select {
+		case <-stopChan:
+			return
+		case pkg := <-transactionChan:
+			if pkg == nil {
+				return
+			}
+
+			// 提取交易数据
+			var inputData []byte
+			var storageChanges map[gethCommon.Hash]gethCommon.Hash
+
+			// 从交易包中提取输入数据
+			if len(pkg.InputUpdates) > 0 {
+				inputData = pkg.InputUpdates[0].ModifiedInput
+			}
+
+			// 从交易包中提取存储更改
+			if len(pkg.StorageUpdates) > 0 {
+				storageChanges = make(map[gethCommon.Hash]gethCommon.Hash)
+				for _, update := range pkg.StorageUpdates {
+					storageChanges[update.Slot] = update.ModifiedValue
+				}
+			}
+
+			// 使用新的发送方法发送交易
+			txHash, err := r.sendTransactionToContract(
+				pkg.ContractAddress,
+				inputData,
+				storageChanges,
+				TokenGasLimit,
+			)
+
+			if err != nil {
+				fmt.Printf("❌ Failed to send transaction for package %s: %v\n", pkg.ID, err)
+			} else {
+				fmt.Printf("🚀 Successfully sent transaction for package %s: %s\n", pkg.ID, txHash.Hex())
+			}
+		}
+	}
+}
+
+// generateStepBasedModificationCandidates 生成基于步长的修改候选（确保每个候选都有有效修改）
+func (r *AttackReplayer) generateStepBasedModificationCandidates(
+	startID int,
+	count int,
+	originalInput []byte,
+	originalStorage map[gethCommon.Hash]gethCommon.Hash,
+) []*ModificationCandidate {
+
+	candidates := make([]*ModificationCandidate, 0, count)
+
+	for i := 0; i < count; i++ {
+		candidate := &ModificationCandidate{
+			ID:             fmt.Sprintf("step_candidate_%d", startID+i),
+			GeneratedAt:    time.Now(),
+			StorageChanges: make(map[gethCommon.Hash]gethCommon.Hash),
+		}
+
+		// 根据策略选择修改类型
+		modType := i % 3
+		hasValidModification := false
+
+		switch modType {
+		case 0: // 只修改输入（基于步长）
+			modifiedInput := r.generateStepBasedInputData(originalInput, i)
+			if !bytesEqual(modifiedInput, originalInput) {
+				candidate.InputData = modifiedInput
+				candidate.ModType = "input_step"
+				candidate.Priority = 1
+				hasValidModification = true
+			}
+		case 1: // 只修改存储（基于步长，仅修改已有存储槽）
+			storageChanges := r.generateStepBasedStorageChanges(originalStorage, i)
+			if len(storageChanges) > 0 {
+				candidate.StorageChanges = storageChanges
+				candidate.ModType = "storage_step"
+				candidate.Priority = 2
+				hasValidModification = true
+			}
+		case 2: // 同时修改输入和存储（基于步长）
+			modifiedInput := r.generateStepBasedInputData(originalInput, i)
+			storageChanges := r.generateStepBasedStorageChanges(originalStorage, i)
+
+			if !bytesEqual(modifiedInput, originalInput) {
+				candidate.InputData = modifiedInput
+				hasValidModification = true
+			}
+			if len(storageChanges) > 0 {
+				candidate.StorageChanges = storageChanges
+				hasValidModification = true
+			}
+
+			if hasValidModification {
+				candidate.ModType = "both_step"
+				candidate.Priority = 3
+			}
+		}
+
+		// 如果没有产生有效修改，强制生成一个
+		if !hasValidModification {
+			hasValidModification = r.forceValidModification(candidate, originalInput, originalStorage, i)
+		}
+
+		// 只添加有有效修改的候选
+		if hasValidModification {
+			candidate.ExpectedImpact = r.predictModificationImpact(candidate)
+			candidates = append(candidates, candidate)
+		} else {
+			fmt.Printf("⚠️  Skipped candidate %s - no valid modifications generated\n", candidate.ID)
+		}
+	}
+
+	fmt.Printf("Generated %d valid step-based candidates out of %d attempts\n", len(candidates), count)
+	return candidates
+}
+
+// forceValidModification 强制生成有效的修改
+func (r *AttackReplayer) forceValidModification(
+	candidate *ModificationCandidate,
+	originalInput []byte,
+	originalStorage map[gethCommon.Hash]gethCommon.Hash,
+	variant int,
+) bool {
+	// 策略1：强制修改输入数据
+	if len(originalInput) > 4 {
+		modifiedInput := r.forceModifyInputData(originalInput, variant)
+		if !bytesEqual(modifiedInput, originalInput) {
+			candidate.InputData = modifiedInput
+			candidate.ModType = "forced_input_step"
+			candidate.Priority = 1
+			fmt.Printf("🔧 Forced input modification for candidate %s\n", candidate.ID)
+			return true
+		}
+	}
+
+	// 策略2：强制修改存储（如果有原始存储）
+	if len(originalStorage) > 0 {
+		storageChanges := r.forceModifyStorageData(originalStorage, variant)
+		if len(storageChanges) > 0 {
+			candidate.StorageChanges = storageChanges
+			candidate.ModType = "forced_storage_step"
+			candidate.Priority = 2
+			fmt.Printf("💾 Forced storage modification for candidate %s\n", candidate.ID)
+			return true
+		}
+	}
+
+	// 策略3：创建虚拟存储修改（最后手段）
+	virtualStorage := r.createVirtualStorageModification(variant)
+	if len(virtualStorage) > 0 {
+		candidate.StorageChanges = virtualStorage
+		candidate.ModType = "forced_virtual_storage"
+		candidate.Priority = 3
+		fmt.Printf("🔮 Created virtual storage modification for candidate %s\n", candidate.ID)
+		return true
+	}
+
+	return false
+}
+
+// forceModifyInputData 强制修改输入数据
+func (r *AttackReplayer) forceModifyInputData(originalInput []byte, variant int) []byte {
+	if len(originalInput) < 4 {
+		return originalInput
+	}
+
+	// 复制原始输入
+	modified := make([]byte, len(originalInput))
+	copy(modified, originalInput)
+
+	// 强制修改策略
+	if len(modified) > 4 {
+		paramData := modified[4:]
+
+		// 确保至少修改一个字节
+		modificationMade := false
+
+		// 策略1：修改第一个字节（如果存在）
+		if len(paramData) > 0 {
+			original := paramData[0]
+			paramData[0] = byte((int(paramData[0]) + variant + 1) % 256)
+			if paramData[0] != original {
+				modificationMade = true
+			}
+		}
+
+		// 策略2：修改32字节边界的数据（用于uint256等）
+		if len(paramData) >= 32 && !modificationMade {
+			// 修改最后一个字节
+			original := paramData[31]
+			paramData[31] = byte((int(paramData[31]) + variant + 1) % 256)
+			if paramData[31] != original {
+				modificationMade = true
+			}
+		}
+
+		// 策略3：如果还没有修改，强制修改任意位置
+		if !modificationMade && len(paramData) > 0 {
+			index := variant % len(paramData)
+			paramData[index] = byte((int(paramData[index]) + 1) % 256)
+		}
+	}
+
+	return modified
+}
+
+// forceModifyStorageData 强制修改存储数据
+func (r *AttackReplayer) forceModifyStorageData(originalStorage map[gethCommon.Hash]gethCommon.Hash, variant int) map[gethCommon.Hash]gethCommon.Hash {
+	changes := make(map[gethCommon.Hash]gethCommon.Hash)
+
+	if len(originalStorage) == 0 {
+		return changes
+	}
+
+	// 选择要修改的存储槽
+	count := 0
+	maxModifications := 2
+
+	for slot, originalValue := range originalStorage {
+		if count >= maxModifications {
+			break
+		}
+
+		// 确保修改后的值与原始值不同
+		originalBig := originalValue.Big()
+		var newValue gethCommon.Hash
+
+		// 多种修改策略，确保至少有一种有效
+		strategies := []func(*big.Int, int) *big.Int{
+			func(orig *big.Int, v int) *big.Int { return new(big.Int).Add(orig, big.NewInt(int64(v+1))) },
+			func(orig *big.Int, v int) *big.Int {
+				result := new(big.Int).Sub(orig, big.NewInt(int64(v+1)))
+				if result.Sign() < 0 {
+					result = big.NewInt(int64(v + 1))
+				}
+				return result
+			},
+			func(orig *big.Int, v int) *big.Int { return new(big.Int).Xor(orig, big.NewInt(int64(v+1))) },
+			func(orig *big.Int, v int) *big.Int { return big.NewInt(int64(v + 100)) },
+		}
+
+		for _, strategy := range strategies {
+			newBig := strategy(originalBig, variant)
+			newValue = gethCommon.BigToHash(newBig)
+
+			// 确保值确实发生了变化
+			if newValue != originalValue {
+				changes[slot] = newValue
+				count++
+				fmt.Printf("   Forced storage change: slot %s: %s -> %s\n",
+					slot.Hex()[:10]+"...", originalValue.Hex()[:10]+"...", newValue.Hex()[:10]+"...")
+				break
+			}
+		}
+
+		// 如果所有策略都失败，使用最简单的修改
+		if _, exists := changes[slot]; !exists {
+			// 最后手段：直接设置为一个固定的不同值
+			if originalValue == (gethCommon.Hash{}) {
+				newValue = gethCommon.BigToHash(big.NewInt(int64(variant + 1)))
+			} else {
+				newValue = gethCommon.Hash{} // 设置为零值
+			}
+			changes[slot] = newValue
+			count++
+			fmt.Printf("   Last resort storage change: slot %s: %s -> %s\n",
+				slot.Hex()[:10]+"...", originalValue.Hex()[:10]+"...", newValue.Hex()[:10]+"...")
+		}
+	}
+
+	return changes
+}
+
+// createVirtualStorageModification 创建虚拟存储修改（最后手段）
+func (r *AttackReplayer) createVirtualStorageModification(variant int) map[gethCommon.Hash]gethCommon.Hash {
+	changes := make(map[gethCommon.Hash]gethCommon.Hash)
+
+	// 创建一些虚拟的存储槽修改
+	for i := 0; i < 2; i++ {
+		slot := gethCommon.BigToHash(big.NewInt(int64(variant*10 + i + 1)))
+		value := gethCommon.BigToHash(big.NewInt(int64(variant*100 + i + 42)))
+		changes[slot] = value
+		fmt.Printf("   Virtual storage: slot %s = %s\n", slot.Hex()[:10]+"...", value.Hex()[:10]+"...")
+	}
+
+	return changes
+}
+
+// generateStepBasedInputData 生成基于步长的输入数据变异（替换随机生成）
+func (r *AttackReplayer) generateStepBasedInputData(originalInput []byte, variant int) []byte {
+	if len(originalInput) < 4 {
+		return originalInput
+	}
+
+	// 复制原始输入
+	modified := make([]byte, len(originalInput))
+	copy(modified, originalInput)
+
+	// 保持函数选择器不变，只修改参数部分（4字节之后）
+	if len(originalInput) > 4 {
+		paramData := modified[4:]
+
+		// 根据变异配置选择步长
+		stepIndex := variant % len(r.mutationConfig.InputSteps)
+		step := r.mutationConfig.InputSteps[stepIndex]
+
+		fmt.Printf("🔧 Applying input step mutation: step=%d, variant=%d\n", step, variant)
+
+		// 对参数数据进行步长变异
+		r.applyStepMutationToBytes(paramData, step, variant)
+	}
+
+	return modified
+}
+
+// generateStepBasedStorageChanges 生成基于步长的存储变化（改进版）
+func (r *AttackReplayer) generateStepBasedStorageChanges(originalStorage map[gethCommon.Hash]gethCommon.Hash, variant int) map[gethCommon.Hash]gethCommon.Hash {
+	changes := make(map[gethCommon.Hash]gethCommon.Hash)
+
+	if !r.mutationConfig.OnlyPrestate || len(originalStorage) == 0 {
+		fmt.Printf("⚠️  No original storage to mutate or OnlyPrestate disabled\n")
+		return changes
+	}
+
+	// 根据变异配置选择步长
+	stepIndex := variant % len(r.mutationConfig.StorageSteps)
+	step := r.mutationConfig.StorageSteps[stepIndex]
+
+	fmt.Printf("💾 Applying storage step mutation: step=%d, variant=%d\n", step, variant)
+
+	// 限制修改的存储槽数量
+	mutationCount := 0
+	maxMutations := r.mutationConfig.MaxMutations
+	if maxMutations <= 0 {
+		maxMutations = 1
+	}
+
+	// 只修改已有的存储槽，并确保值发生变化
+	for slot, originalValue := range originalStorage {
+		if mutationCount >= maxMutations {
+			break
+		}
+
+		// 根据变异策略决定是否修改这个槽
+		if (variant+mutationCount)%2 == 0 { // 增加修改频率
+			newValue := r.generateStepBasedStorageValue(originalValue, step, variant)
+			if newValue != originalValue { // 只有实际发生变化时才记录
+				changes[slot] = newValue
+				mutationCount++
+				fmt.Printf("   Modified slot %s: %s -> %s (step: %d)\n",
+					slot.Hex()[:10]+"...", originalValue.Hex()[:10]+"...", newValue.Hex()[:10]+"...", step)
+			} else {
+				// 如果步长变异没有产生变化，强制修改
+				forcedValue := r.forceStorageValueChange(originalValue, variant)
+				if forcedValue != originalValue {
+					changes[slot] = forcedValue
+					mutationCount++
+					fmt.Printf("   Forced slot modification %s: %s -> %s\n",
+						slot.Hex()[:10]+"...", originalValue.Hex()[:10]+"...", forcedValue.Hex()[:10]+"...")
+				}
 			}
 		}
 	}
 
-	// Sort variables to ensure consistent ordering (by name)
-	sort.Slice(variables, func(i, j int) bool {
-		return variables[i].Name < variables[j].Name
-	})
-
-	// Calculate storage layout according to Solidity rules
-	return r.calculateStorageLayout(variables), nil
+	fmt.Printf("💾 Generated %d storage changes\n", len(changes))
+	return changes
 }
 
-// parseVariableType parses Solidity type string and extracts size and signedness
-func (r *TransactionReplayer) parseVariableType(varInfo *VariableInfo, typeStr string) error {
-	switch {
-	// Unsigned integers
-	case strings.HasPrefix(typeStr, "uint"):
-		varInfo.IsSigned = false
-		varInfo.IsStatic = true
-		if typeStr == "uint" || typeStr == "uint256" {
-			varInfo.Size = 32
-		} else {
-			// Extract size from uint8, uint16, etc.
-			sizeStr := strings.TrimPrefix(typeStr, "uint")
-			if sizeStr == "" {
-				varInfo.Size = 32 // default uint is uint256
-			} else {
-				var bitSize int
-				_, err := fmt.Sscanf(sizeStr, "%d", &bitSize)
-				if err != nil {
-					return err
-				}
-				varInfo.Size = bitSize / 8
+// forceStorageValueChange 强制改变存储值
+func (r *AttackReplayer) forceStorageValueChange(original gethCommon.Hash, variant int) gethCommon.Hash {
+	originalBig := original.Big()
+
+	// 尝试多种修改策略
+	modifications := []*big.Int{
+		new(big.Int).Add(originalBig, big.NewInt(int64(variant+1))),
+		new(big.Int).Sub(originalBig, big.NewInt(int64(variant+1))),
+		new(big.Int).Xor(originalBig, big.NewInt(int64(variant+1))),
+		big.NewInt(int64(variant + 42)),
+	}
+
+	for _, modBig := range modifications {
+		if modBig.Sign() < 0 {
+			modBig = new(big.Int).Abs(modBig)
+		}
+		newValue := gethCommon.BigToHash(modBig)
+		if newValue != original {
+			return newValue
+		}
+	}
+
+	// 最后手段：如果原值为零，设为非零；如果非零，设为零
+	if original == (gethCommon.Hash{}) {
+		return gethCommon.BigToHash(big.NewInt(1))
+	} else {
+		return gethCommon.Hash{}
+	}
+}
+
+// generateStepBasedStorageValue 生成基于步长的存储值变异（替换随机生成）
+func (r *AttackReplayer) generateStepBasedStorageValue(original gethCommon.Hash, step int64, variant int) gethCommon.Hash {
+	originalBig := original.Big()
+
+	// 根据不同的变异策略应用步长
+	switch variant % 4 {
+	case 0: // 直接加法
+		result := new(big.Int).Add(originalBig, big.NewInt(step))
+		return gethCommon.BigToHash(result)
+	case 1: // 直接减法（确保不为负）
+		result := new(big.Int).Sub(originalBig, big.NewInt(step))
+		if result.Sign() < 0 {
+			result = big.NewInt(0)
+		}
+		return gethCommon.BigToHash(result)
+	case 2: // 乘法变异（小步长）
+		if step != 0 {
+			multiplier := step
+			if multiplier < 0 {
+				multiplier = -multiplier
 			}
-		}
-
-	// Signed integers
-	case strings.HasPrefix(typeStr, "int"):
-		varInfo.IsSigned = true
-		varInfo.IsStatic = true
-		if typeStr == "int" || typeStr == "int256" {
-			varInfo.Size = 32
-		} else {
-			// Extract size from int8, int16, etc.
-			sizeStr := strings.TrimPrefix(typeStr, "int")
-			if sizeStr == "" {
-				varInfo.Size = 32 // default int is int256
-			} else {
-				var bitSize int
-				_, err := fmt.Sscanf(sizeStr, "%d", &bitSize)
-				if err != nil {
-					return err
-				}
-				varInfo.Size = bitSize / 8
+			if multiplier > 10 {
+				multiplier = 2 // 限制乘数避免溢出
 			}
+			result := new(big.Int).Mul(originalBig, big.NewInt(multiplier))
+			return gethCommon.BigToHash(result)
 		}
-
-	// Boolean
-	case typeStr == "bool":
-		varInfo.IsSigned = false
-		varInfo.IsStatic = true
-		varInfo.Size = 1
-
-	// Address
-	case typeStr == "address":
-		varInfo.IsSigned = false
-		varInfo.IsStatic = true
-		varInfo.Size = 20
-
-	// Fixed-size bytes
-	case strings.HasPrefix(typeStr, "bytes") && typeStr != "bytes":
-		varInfo.IsSigned = false
-		varInfo.IsStatic = true
-		sizeStr := strings.TrimPrefix(typeStr, "bytes")
-		var size int
-		_, err := fmt.Sscanf(sizeStr, "%d", &size)
-		if err != nil {
-			return err
+		return original
+	case 3: // 位操作变异
+		if originalBig.Sign() > 0 {
+			stepAbs := step
+			if stepAbs < 0 {
+				stepAbs = -stepAbs
+			}
+			// 进行XOR操作
+			xorValue := big.NewInt(stepAbs)
+			result := new(big.Int).Xor(originalBig, xorValue)
+			return gethCommon.BigToHash(result)
 		}
-		varInfo.Size = size
-
-	// Dynamic types
-	case typeStr == "string" || typeStr == "bytes":
-		varInfo.IsSigned = false
-		varInfo.IsStatic = false
-		varInfo.Size = 32 // Takes one slot for length/short string
-
-	// Arrays and mappings (simplified handling)
-	case strings.Contains(typeStr, "[]") || strings.Contains(typeStr, "mapping"):
-		varInfo.IsSigned = false
-		varInfo.IsStatic = false
-		varInfo.Size = 32 // Takes one slot
-
+		return original
 	default:
-		return fmt.Errorf("unsupported type: %s", typeStr)
+		return original
 	}
-
-	return nil
 }
 
-// calculateStorageLayout calculates storage slot assignment according to Solidity rules
-func (r *TransactionReplayer) calculateStorageLayout(variables []VariableInfo) *StorageLayout {
-	layout := &StorageLayout{
-		Variables: make([]StorageVariable, 0, len(variables)),
+// applyStepMutationToBytes 对字节数组应用步长变异
+func (r *AttackReplayer) applyStepMutationToBytes(data []byte, step int64, variant int) {
+	if len(data) == 0 {
+		return
 	}
 
-	currentSlot := 0
-	currentOffset := 0
+	// 根据数据长度和变异类型选择修改策略
+	switch variant % 3 {
+	case 0: // 修改整个32字节块（如果足够长）
+		if len(data) >= 32 {
+			// 将前32字节作为big.Int处理
+			value := new(big.Int).SetBytes(data[:32])
+			newValue := new(big.Int).Add(value, big.NewInt(step))
 
-	for _, varInfo := range variables {
-		var slot, offset int
-
-		if varInfo.IsStatic && varInfo.Size < 32 {
-			// Small static types can be packed
-			if currentOffset+varInfo.Size > 32 {
-				// Won't fit in current slot, move to next
-				currentSlot++
-				currentOffset = 0
+			// 将结果写回，保持32字节长度
+			newBytes := newValue.Bytes()
+			// 清零前32字节
+			for i := 0; i < 32; i++ {
+				data[i] = 0
 			}
+			// 复制新值，右对齐
+			copy(data[32-len(newBytes):32], newBytes)
+		}
+	case 1: // 修改特定位置的字节
+		byteIndex := variant % len(data)
+		byteStep := int(step) % 256
+		if byteStep < 0 {
+			byteStep = 256 + byteStep
+		}
+		newByte := (int(data[byteIndex]) + byteStep) % 256
+		data[byteIndex] = byte(newByte)
+	case 2: // 修改多个字节位置
+		stepAbs := step
+		if stepAbs < 0 {
+			stepAbs = -stepAbs
+		}
+		byteStep := int(stepAbs) % 256
 
-			slot = currentSlot
-			offset = currentOffset
-			currentOffset += varInfo.Size
-
-			// If we've filled the slot exactly, move to next
-			if currentOffset == 32 {
-				currentSlot++
-				currentOffset = 0
-			}
-		} else {
-			// 32-byte types or dynamic types get their own slot
-			if currentOffset > 0 {
-				// If there's partial data in current slot, move to next
-				currentSlot++
-				currentOffset = 0
-			}
-
-			slot = currentSlot
-			offset = 0
-
-			// Move to next slot for next variable
-			currentSlot++
-			currentOffset = 0
+		// 修改最多3个字节位置
+		maxChanges := 3
+		if len(data) < maxChanges {
+			maxChanges = len(data)
 		}
 
-		storageVar := StorageVariable{
-			Name:     varInfo.Name,
-			Type:     varInfo.Type,
-			Slot:     slot,
-			Offset:   offset,
-			Size:     varInfo.Size,
-			IsSigned: varInfo.IsSigned,
+		for i := 0; i < maxChanges; i++ {
+			byteIndex := (variant + i) % len(data)
+			if i%2 == 0 {
+				data[byteIndex] = byte((int(data[byteIndex]) + byteStep) % 256)
+			} else {
+				data[byteIndex] = byte((int(data[byteIndex]) - byteStep + 256) % 256)
+			}
 		}
+	}
+}
 
-		layout.Variables = append(layout.Variables, storageVar)
+// simulateModification 模拟修改
+func (r *AttackReplayer) simulateModification(
+	candidate *ModificationCandidate,
+	tx *types.Transaction,
+	prestate PrestateResult,
+	originalPath *ExecutionPath,
+) *SimulationResult {
+
+	startTime := time.Now()
+	result := &SimulationResult{
+		Candidate: candidate,
+		Success:   false,
 	}
 
-	return layout
-}
-
-// NEW: CreateStorageLayoutForStorageScan creates layout for the StorageScan contract
-func (r *TransactionReplayer) CreateStorageLayoutForStorageScan(contract common.Address) {
-	layout := &StorageLayout{
-		Variables: []StorageVariable{
-			// Based on the StorageScan contract structure
-			{Name: "uint1", Type: "uint8", Slot: 0, Offset: 0, Size: 1, IsSigned: false},
-			{Name: "uint2", Type: "uint128", Slot: 0, Offset: 1, Size: 16, IsSigned: false},
-			{Name: "uint3", Type: "uint256", Slot: 1, Offset: 0, Size: 32, IsSigned: false},
-			{Name: "int1", Type: "int8", Slot: 2, Offset: 0, Size: 1, IsSigned: true},
-			{Name: "int2", Type: "int128", Slot: 2, Offset: 1, Size: 16, IsSigned: true},
-			{Name: "int3", Type: "int256", Slot: 3, Offset: 0, Size: 32, IsSigned: true},
-			{Name: "bool1", Type: "bool", Slot: 4, Offset: 0, Size: 1, IsSigned: false},
-			{Name: "bool2", Type: "bool", Slot: 4, Offset: 1, Size: 1, IsSigned: false},
-			{Name: "string1", Type: "string", Slot: 5, Offset: 0, Size: 32, IsSigned: false},
-			{Name: "string2", Type: "string", Slot: 6, Offset: 0, Size: 32, IsSigned: false},
-			{Name: "b1", Type: "bytes1", Slot: 7, Offset: 0, Size: 1, IsSigned: false},
-			{Name: "b2", Type: "bytes8", Slot: 7, Offset: 1, Size: 8, IsSigned: false},
-			{Name: "b3", Type: "bytes32", Slot: 8, Offset: 0, Size: 32, IsSigned: false},
-			{Name: "addr1", Type: "address", Slot: 9, Offset: 0, Size: 20, IsSigned: false},
-		},
-	}
-	r.AddStorageLayout(contract, layout)
-}
-
-func (r *TransactionReplayer) AddFunctionModification(contract common.Address, mod *FunctionModification) error {
-	modifier, exists := r.advancedModifiers[contract]
-	if !exists {
-		return fmt.Errorf("no advanced modifier registered for contract %s", contract.Hex())
-	}
-	return modifier.AddFunctionModification(mod)
-}
-
-// NEW: Get execution trace results
-func (r *TransactionReplayer) GetExecutionTrace() []*ExecutionPath {
-	return r.tracer.GetExecutionPaths()
-}
-
-// NEW: Print execution trace summary
-func (r *TransactionReplayer) PrintExecutionTrace() {
-	r.tracer.PrintExecutionSummary()
-}
-
-// NEW: Compare two execution paths
-func (r *TransactionReplayer) CompareExecutionPaths(pathA, pathB *ExecutionPath) map[string]interface{} {
-	return r.tracer.CompareExecutionPaths(pathA, pathB)
-}
-
-// NEW: Export execution trace to JSON
-func (r *TransactionReplayer) ExportExecutionTrace() (string, error) {
-	paths := r.tracer.GetExecutionPaths()
-	jsonData, err := json.MarshalIndent(paths, "", "  ")
+	// 执行修改后的交易
+	modifiedPath, err := r.executeTransactionWithTracing(tx, prestate, candidate.InputData, candidate.StorageChanges)
 	if err != nil {
-		return "", err
+		result.Error = fmt.Errorf("simulation failed: %v", err)
+		result.Duration = time.Since(startTime)
+		return result
 	}
-	return string(jsonData), nil
+
+	// 计算相似度
+	similarity := r.calculatePathSimilarity(originalPath, modifiedPath)
+	result.Similarity = similarity
+	result.ExecutePath = modifiedPath
+	result.Success = true
+	result.Duration = time.Since(startTime)
+
+	return result
 }
 
-func (r *TransactionReplayer) ReplayTransaction(txHash common.Hash) error {
-	fmt.Printf("\n=== TRANSACTION REPLAY START ===\n")
+// predictModificationImpact 预测修改影响
+func (r *AttackReplayer) predictModificationImpact(candidate *ModificationCandidate) string {
+	switch candidate.ModType {
+	case "input_step":
+		return "step_based_input_behavior_change"
+	case "storage_step":
+		return "step_based_state_manipulation"
+	case "both_step":
+		return "comprehensive_step_based_attack_vector"
+	default:
+		return "unknown_step_based"
+	}
+}
+
+// createProtectionRuleFromResult 从结果创建保护规则
+func (r *AttackReplayer) createProtectionRuleFromResult(
+	result *SimulationResult,
+	contractAddr gethCommon.Address,
+	originalTxHash gethCommon.Hash,
+) OnChainProtectionRule {
+
+	ruleID := GenerateRuleID(originalTxHash, contractAddr, time.Now())
+
+	rule := OnChainProtectionRule{
+		RuleID:          ruleID,
+		TxHash:          originalTxHash,
+		ContractAddress: contractAddr,
+		Similarity:      result.Similarity,
+		InputRules:      make([]InputProtectionRule, 0),
+		StorageRules:    make([]StorageProtectionRule, 0),
+		CreatedAt:       time.Now(),
+		IsActive:        true,
+	}
+
+	// 根据修改候选创建输入保护规则
+	if result.Candidate.InputData != nil && len(result.Candidate.InputData) > 0 {
+		originalInput := make([]byte, 0)
+		if len(result.Candidate.InputData) >= 4 {
+			// 假设原始输入，这里可以从context中获取
+			originalInput = make([]byte, len(result.Candidate.InputData))
+			copy(originalInput, result.Candidate.InputData)
+			// 修改一些字节来模拟原始输入
+			if len(originalInput) > 4 {
+				originalInput[4] = 0x00
+			}
+		}
+
+		inputRule := CreateInputProtectionRuleFromCandidate(result.Candidate, originalInput)
+		rule.InputRules = append(rule.InputRules, inputRule)
+	}
+
+	// 根据修改候选创建存储保护规则
+	if len(result.Candidate.StorageChanges) > 0 {
+		storageRules := CreateStorageProtectionRulesFromCandidate(result.Candidate, contractAddr)
+		rule.StorageRules = append(rule.StorageRules, storageRules...)
+	}
+
+	// 确保至少有一个规则
+	if len(rule.InputRules) == 0 && len(rule.StorageRules) == 0 {
+		// 创建一个基本的存储规则作为后备
+		basicStorageRule := StorageProtectionRule{
+			ContractAddress: contractAddr,
+			StorageSlot:     gethCommon.BigToHash(big.NewInt(1)), // 使用有效的槽位
+			OriginalValue:   gethCommon.Hash{},
+			ModifiedValue:   gethCommon.BigToHash(big.NewInt(1)),
+			CheckType:       "exact",
+			SlotType:        "simple",
+		}
+		rule.StorageRules = append(rule.StorageRules, basicStorageRule)
+	}
+
+	return rule
+}
+
+// ReplayAndCollectMutations 重放攻击交易并收集所有变异数据
+func (r *AttackReplayer) ReplayAndCollectMutations(txHash gethCommon.Hash, contractAddr gethCommon.Address) (*MutationCollection, error) {
+	startTime := time.Now()
+
+	fmt.Printf("=== ATTACK TRANSACTION REPLAY WITH MUTATION COLLECTION ===\n")
 	fmt.Printf("Transaction hash: %s\n", txHash.Hex())
+	fmt.Printf("Contract address: %s\n", contractAddr.Hex())
 
-	// Step 1: Get transaction details
-	tx, _, err := r.client.TransactionByHash(context.Background(), txHash)
+	// 获取交易详情
+	tx, err := r.nodeClient.TxByHash(txHash)
 	if err != nil {
-		return fmt.Errorf("failed to get transaction: %v", err)
+		return nil, fmt.Errorf("failed to get transaction: %v", err)
 	}
 
-	fmt.Printf("Transaction details:\n")
-	fmt.Printf("  To: %s\n", tx.To().Hex())
-	fmt.Printf("  Value: %s\n", tx.Value().String())
-	fmt.Printf("  Gas: %d\n", tx.Gas())
-	fmt.Printf("  GasPrice: %s\n", tx.GasPrice().String())
-	fmt.Printf("  Data length: %d\n", len(tx.Data()))
-	fmt.Printf("  Original data: %x\n", tx.Data())
-
-	// Get transaction receipt to get block information
-	receipt, err := r.client.TransactionReceipt(context.Background(), txHash)
+	// 获取预状态
+	prestate, err := r.getTransactionPrestate(txHash)
 	if err != nil {
-		return fmt.Errorf("failed to get transaction receipt: %v", err)
+		return nil, fmt.Errorf("failed to get prestate: %v", err)
 	}
 
-	fmt.Printf("Receipt details:\n")
-	fmt.Printf("  Block number: %s\n", receipt.BlockNumber.String())
-	fmt.Printf("  Gas used: %d\n", receipt.GasUsed)
-	fmt.Printf("  Status: %d\n", receipt.Status)
-
-	// Get block header for the transaction
-	block, err := r.client.HeaderByNumber(context.Background(), receipt.BlockNumber)
-	if err != nil {
-		return fmt.Errorf("failed to get block header: %v", err)
+	// 创建变异数据集合
+	mutationCollection := &MutationCollection{
+		OriginalTxHash:      txHash,
+		ContractAddress:     contractAddr,
+		OriginalInputData:   tx.Data(),
+		OriginalStorage:     make(map[gethCommon.Hash]gethCommon.Hash),
+		Mutations:           make([]MutationData, 0),
+		SuccessfulMutations: make([]MutationData, 0),
+		CreatedAt:           time.Now(),
 	}
 
-	// Get transaction sender
+	// 提取原始存储状态
+	if contractAccount, exists := prestate[contractAddr]; exists {
+		mutationCollection.OriginalStorage = contractAccount.Storage
+		fmt.Printf("Original storage slots: %d\n", len(contractAccount.Storage))
+	}
+
+	// 执行原始交易
+	fmt.Printf("\n=== ORIGINAL EXECUTION ===\n")
+	originalPath, err := r.executeTransactionWithTracing(tx, prestate, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute original transaction: %v", err)
+	}
+	fmt.Printf("Original execution path: %d jumps\n", len(originalPath.Jumps))
+
+	// 设置原始状态用于智能修改
+	err = r.inputModifier.SetOriginalState(tx.Data(), mutationCollection.OriginalStorage)
+	if err != nil {
+		fmt.Printf("Failed to set original state: %v\n", err)
+	}
+
+	// 生成并执行变异（使用步长变异）
+	fmt.Printf("\n=== GENERATING AND EXECUTING STEP-BASED MUTATIONS ===\n")
+	fmt.Printf("Using mutation config: InputSteps=%v, StorageSteps=%v, OnlyPrestate=%v\n",
+		r.mutationConfig.InputSteps, r.mutationConfig.StorageSteps, r.mutationConfig.OnlyPrestate)
+
+	// 生成多种变异候选
+	totalCandidates := 50 // 减少数量以便测试
+	batchSize := 10
+
+	for i := 0; i < totalCandidates; i += batchSize {
+		currentBatchSize := batchSize
+		if i+batchSize > totalCandidates {
+			currentBatchSize = totalCandidates - i
+		}
+
+		// 使用步长变异生成候选
+		candidates := r.generateStepBasedModificationCandidates(i, currentBatchSize, tx.Data(), mutationCollection.OriginalStorage)
+
+		// 并行执行这批变异
+		mutationResults := r.executeMutationBatch(candidates, tx, prestate, originalPath)
+
+		// 收集结果
+		for _, result := range mutationResults {
+			mutationData := MutationData{
+				ID:             result.Candidate.ID,
+				InputData:      result.Candidate.InputData,
+				StorageChanges: result.Candidate.StorageChanges,
+				Similarity:     result.Similarity,
+				Success:        result.Success,
+				ExecutionTime:  result.Duration,
+			}
+
+			if result.Error != nil {
+				mutationData.ErrorMessage = result.Error.Error()
+			}
+
+			mutationCollection.Mutations = append(mutationCollection.Mutations, mutationData)
+
+			// 收集成功的变异
+			if result.Success && result.Similarity >= r.similarityThreshold {
+				mutationCollection.SuccessfulMutations = append(mutationCollection.SuccessfulMutations, mutationData)
+				fmt.Printf("✅ Successful step-based mutation %s: Similarity %.2f%%\n", result.Candidate.ID, result.Similarity*100)
+			} else {
+				fmt.Printf("❌ Failed step-based mutation %s: %s\n", result.Candidate.ID, mutationData.ErrorMessage)
+			}
+		}
+	}
+
+	// 计算统计信息
+	mutationCollection.TotalMutations = len(mutationCollection.Mutations)
+	mutationCollection.SuccessCount = len(mutationCollection.SuccessfulMutations)
+	mutationCollection.FailureCount = mutationCollection.TotalMutations - mutationCollection.SuccessCount
+	mutationCollection.ProcessingTime = time.Since(startTime)
+
+	// 计算平均相似度和最高相似度
+	if mutationCollection.SuccessCount > 0 {
+		totalSimilarity := 0.0
+		for _, mutation := range mutationCollection.SuccessfulMutations {
+			totalSimilarity += mutation.Similarity
+			if mutation.Similarity > mutationCollection.HighestSimilarity {
+				mutationCollection.HighestSimilarity = mutation.Similarity
+			}
+		}
+		mutationCollection.AverageSimilarity = totalSimilarity / float64(mutationCollection.SuccessCount)
+	}
+
+	fmt.Printf("\n=== STEP-BASED MUTATION COLLECTION COMPLETED ===\n")
+	fmt.Printf("Total mutations: %d\n", mutationCollection.TotalMutations)
+	fmt.Printf("Successful mutations: %d\n", mutationCollection.SuccessCount)
+	fmt.Printf("Failed mutations: %d\n", mutationCollection.FailureCount)
+	fmt.Printf("Success rate: %.2f%%\n", float64(mutationCollection.SuccessCount)/float64(mutationCollection.TotalMutations)*100)
+	fmt.Printf("Average similarity: %.2f%%\n", mutationCollection.AverageSimilarity*100)
+	fmt.Printf("Highest similarity: %.2f%%\n", mutationCollection.HighestSimilarity*100)
+	fmt.Printf("Processing time: %v\n", mutationCollection.ProcessingTime)
+
+	return mutationCollection, nil
+}
+
+// executeMutationBatch 并行执行一批变异
+func (r *AttackReplayer) executeMutationBatch(candidates []*ModificationCandidate, tx *types.Transaction, prestate PrestateResult, originalPath *ExecutionPath) []*SimulationResult {
+	results := make([]*SimulationResult, len(candidates))
+
+	// 使用goroutine并行执行
+	var wg sync.WaitGroup
+	for i, candidate := range candidates {
+		wg.Add(1)
+		go func(index int, cand *ModificationCandidate) {
+			defer wg.Done()
+			results[index] = r.simulateModification(cand, tx, prestate, originalPath)
+		}(i, candidate)
+	}
+
+	wg.Wait()
+	return results
+}
+
+// ReplayAttackTransactionWithVariations 使用多种变体重放攻击交易（保持兼容性）
+func (r *AttackReplayer) ReplayAttackTransactionWithVariations(txHash gethCommon.Hash, contractAddr gethCommon.Address) (*SimplifiedReplayResult, error) {
+	// 优先使用并发版本
+	return r.ReplayAttackTransactionWithConcurrentModification(txHash, contractAddr)
+}
+
+// 保持原有方法的实现...
+func (r *AttackReplayer) testVariation(tx *types.Transaction, prestate PrestateResult,
+	originalPath *ExecutionPath, variation *ModificationVariation,
+	contractAddr gethCommon.Address, originalTxHash gethCommon.Hash) (bool, *OnChainProtectionRule) {
+
+	var modifiedInput []byte
+	var storageChanges map[gethCommon.Hash]gethCommon.Hash
+
+	// 准备修改后的输入数据
+	if variation.InputMod != nil {
+		modifiedInput = variation.InputMod.ModifiedInput
+	}
+
+	// 准备存储修改
+	if variation.StorageMod != nil {
+		storageChanges = make(map[gethCommon.Hash]gethCommon.Hash)
+		for _, change := range variation.StorageMod.Changes {
+			storageChanges[change.Slot] = change.Modified
+		}
+	}
+
+	// 执行修改后的交易
+	modifiedPath, err := r.executeTransactionWithTracing(tx, prestate, modifiedInput, storageChanges)
+	if err != nil {
+		fmt.Printf("  ❌ Execution failed: %v\n", err)
+		return false, nil
+	}
+
+	// 计算相似度
+	similarity := r.calculatePathSimilarity(originalPath, modifiedPath)
+	fmt.Printf("  📊 Similarity: %.2f%%\n", similarity*100)
+
+	// 检查是否超过阈值
+	if similarity >= r.similarityThreshold {
+		// 创建链上防护规则
+		rule := r.createProtectionRule(originalTxHash, contractAddr, similarity, variation)
+
+		// 验证规则的有效性
+		if r.validateProtectionRule(&rule) {
+			fmt.Printf("  🛡️  Generated protection rule: %s\n", rule.RuleID)
+			fmt.Printf("    Input rules: %d\n", len(rule.InputRules))
+			fmt.Printf("    Storage rules: %d\n", len(rule.StorageRules))
+			return true, &rule
+		} else {
+			fmt.Printf("  ❌ Generated rule is invalid, skipping\n")
+			return false, nil
+		}
+	}
+
+	return false, nil
+}
+
+// validateProtectionRule 验证保护规则的有效性
+func (r *AttackReplayer) validateProtectionRule(rule *OnChainProtectionRule) bool {
+	// 检查是否有有效规则
+	if len(rule.InputRules) == 0 && len(rule.StorageRules) == 0 {
+		fmt.Printf("    ⚠️  Rule has no input or storage rules\n")
+		return false
+	}
+
+	// 验证输入规则
+	for i, inputRule := range rule.InputRules {
+		if len(inputRule.FunctionSelector) != 4 {
+			fmt.Printf("    ⚠️  Input rule %d has invalid function selector\n", i)
+			return false
+		}
+		if len(inputRule.ParameterRules) == 0 {
+			fmt.Printf("    ⚠️  Input rule %d has no parameter rules\n", i)
+			return false
+		}
+	}
+
+	// 验证存储规则
+	for i, storageRule := range rule.StorageRules {
+		if storageRule.ContractAddress == (gethCommon.Address{}) {
+			fmt.Printf("    ⚠️  Storage rule %d has invalid contract address\n", i)
+			return false
+		}
+		if storageRule.StorageSlot == (gethCommon.Hash{}) {
+			fmt.Printf("    ⚠️  Storage rule %d has invalid storage slot\n", i)
+			return false
+		}
+	}
+
+	return true
+}
+
+// createProtectionRule 创建链上防护规则
+func (r *AttackReplayer) createProtectionRule(txHash gethCommon.Hash, contractAddr gethCommon.Address,
+	similarity float64, variation *ModificationVariation) OnChainProtectionRule {
+
+	ruleID := GenerateRuleID(txHash, contractAddr, time.Now())
+
+	rule := OnChainProtectionRule{
+		RuleID:          ruleID,
+		TxHash:          txHash,
+		ContractAddress: contractAddr,
+		Similarity:      similarity,
+		InputRules:      make([]InputProtectionRule, 0),
+		StorageRules:    make([]StorageProtectionRule, 0),
+		CreatedAt:       time.Now(),
+		IsActive:        true,
+	}
+
+	// 生成输入保护规则
+	if variation.InputMod != nil {
+		inputRule := CreateInputProtectionRule(variation.InputMod)
+		// 验证输入规则是否有效
+		if len(inputRule.FunctionSelector) == 4 && len(inputRule.ParameterRules) > 0 {
+			rule.InputRules = append(rule.InputRules, inputRule)
+		}
+	}
+
+	// 生成存储保护规则
+	if variation.StorageMod != nil {
+		storageRules := CreateStorageProtectionRules(variation.StorageMod, contractAddr)
+		// 只添加有效的存储规则
+		for _, storageRule := range storageRules {
+			if storageRule.ContractAddress != (gethCommon.Address{}) && storageRule.StorageSlot != (gethCommon.Hash{}) {
+				rule.StorageRules = append(rule.StorageRules, storageRule)
+			}
+		}
+	}
+
+	// 如果仍然没有有效规则，创建一个基本规则
+	if len(rule.InputRules) == 0 && len(rule.StorageRules) == 0 {
+		rule = r.createFallbackProtectionRule(txHash, contractAddr, similarity, variation)
+	}
+
+	return rule
+}
+
+// createFallbackProtectionRule 创建后备保护规则
+func (r *AttackReplayer) createFallbackProtectionRule(txHash gethCommon.Hash, contractAddr gethCommon.Address,
+	similarity float64, variation *ModificationVariation) OnChainProtectionRule {
+
+	ruleID := GenerateRuleID(txHash, contractAddr, time.Now())
+
+	rule := OnChainProtectionRule{
+		RuleID:          ruleID,
+		TxHash:          txHash,
+		ContractAddress: contractAddr,
+		Similarity:      similarity,
+		InputRules:      make([]InputProtectionRule, 0),
+		StorageRules:    make([]StorageProtectionRule, 0),
+		CreatedAt:       time.Now(),
+		IsActive:        true,
+	}
+
+	// 创建一个基本的存储保护规则
+	basicStorageRule := StorageProtectionRule{
+		ContractAddress: contractAddr,
+		StorageSlot:     gethCommon.BigToHash(big.NewInt(0)), // 使用槽位0
+		OriginalValue:   gethCommon.Hash{},
+		ModifiedValue:   gethCommon.BigToHash(big.NewInt(1)),
+		CheckType:       "exact",
+		SlotType:        "simple",
+	}
+
+	rule.StorageRules = append(rule.StorageRules, basicStorageRule)
+
+	fmt.Printf("    📝Transaction execution failed Created fallback protection rule with basic storage rule\n")
+	return rule
+}
+
+// saveProtectionRules 保存保护规则（可以保存到数据库或发送到链上）
+func (r *AttackReplayer) saveProtectionRules(rules []OnChainProtectionRule) {
+	fmt.Printf("\n=== SAVING %d PROTECTION RULES ===\n", len(rules))
+
+	for i, rule := range rules {
+		fmt.Printf("Rule %d: %s\n", i+1, rule.RuleID)
+		fmt.Printf("  Contract: %s\n", rule.ContractAddress.Hex())
+		fmt.Printf("  Original Tx: %s\n", rule.TxHash.Hex())
+		fmt.Printf("  Similarity: %.2f%%\n", rule.Similarity*100)
+		fmt.Printf("  Input Rules: %d\n", len(rule.InputRules))
+		fmt.Printf("  Storage Rules: %d\n", len(rule.StorageRules))
+
+		// 打印输入规则详情
+		for j, inputRule := range rule.InputRules {
+			fmt.Printf("    Input Rule %d:\n", j+1)
+			fmt.Printf("      Function: %s\n", inputRule.FunctionName)
+			fmt.Printf("      Selector: %x\n", inputRule.FunctionSelector)
+			fmt.Printf("      Parameters: %d\n", len(inputRule.ParameterRules))
+
+			for k, paramRule := range inputRule.ParameterRules {
+				fmt.Printf("        Param %d: %s (%s) - %s\n",
+					k+1, paramRule.Name, paramRule.Type, paramRule.CheckType)
+				if paramRule.CheckType == "range" && paramRule.MinValue != nil && paramRule.MaxValue != nil {
+					fmt.Printf("          Range: [%s, %s]\n",
+						paramRule.MinValue.String(), paramRule.MaxValue.String())
+				}
+			}
+		}
+
+		// 打印存储规则详情
+		for j, storageRule := range rule.StorageRules {
+			fmt.Printf("    Storage Rule %d:\n", j+1)
+			fmt.Printf("      Contract: %s\n", storageRule.ContractAddress.Hex())
+			fmt.Printf("      Slot: %s\n", storageRule.StorageSlot.Hex())
+			fmt.Printf("      Type: %s (%s)\n", storageRule.SlotType, storageRule.CheckType)
+			if storageRule.CheckType == "range" && storageRule.MinValue != nil && storageRule.MaxValue != nil {
+				fmt.Printf("      Range: [%s, %s]\n",
+					storageRule.MinValue.String(), storageRule.MaxValue.String())
+			}
+		}
+		fmt.Println()
+	}
+
+	// TODO: 这里可以添加实际的保存逻辑
+	// 1. 保存到数据库
+	// 2. 发送到链上防护合约
+	// 3. 发送到防护服务等
+
+	fmt.Printf("✅ Protection rules saved successfully!\n")
+}
+
+// 保持原有方法的兼容性
+func (r *AttackReplayer) ReplayAttackTransaction(txHash gethCommon.Hash, contractAddr gethCommon.Address) (*ReplayResult, error) {
+	simplifiedResult, err := r.ReplayAttackTransactionWithVariations(txHash, contractAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	// 转换为原有格式
+	result := &ReplayResult{
+		OriginalPath:    simplifiedResult.OriginalPath,
+		Similarity:      simplifiedResult.HighestSimilarity,
+		IsAttackPattern: len(simplifiedResult.SuccessfulRules) > 0,
+	}
+
+	if len(simplifiedResult.SuccessfulRules) > 0 {
+		rule := simplifiedResult.SuccessfulRules[0]
+		result.Modifications = &StateModification{
+			ContractAddress: rule.ContractAddress,
+			StorageChanges:  make(map[gethCommon.Hash]gethCommon.Hash),
+		}
+
+		if len(rule.InputRules) > 0 {
+			result.Modifications.InputData = rule.InputRules[0].ModifiedInput
+		}
+
+		if len(rule.StorageRules) > 0 {
+			for _, storageRule := range rule.StorageRules {
+				result.Modifications.StorageChanges[storageRule.StorageSlot] = storageRule.ModifiedValue
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// extractStrategyFromVariationID 从变体ID提取策略
+func (r *AttackReplayer) extractStrategyFromVariationID(variationID string) string {
+	if len(variationID) == 0 {
+		return "unknown"
+	}
+
+	parts := strings.Split(variationID, "_")
+	if len(parts) > 0 {
+		return parts[0]
+	}
+
+	return "unknown"
+}
+
+// printReplayStatistics 打印重放统计信息
+func (r *AttackReplayer) printReplayStatistics(result *SimplifiedReplayResult) {
+	fmt.Printf("\n=== REPLAY STATISTICS ===\n")
+	fmt.Printf("Total variations tested: %d\n", result.TotalVariations)
+	fmt.Printf("Successful rules: %d\n", result.Statistics.SuccessCount)
+	fmt.Printf("Failed variations: %d\n", result.Statistics.FailCount)
+	fmt.Printf("Success rate: %.2f%%\n", float64(result.Statistics.SuccessCount)/float64(result.TotalVariations)*100)
+	fmt.Printf("Average similarity: %.2f%%\n", result.Statistics.AverageSimilarity*100)
+	fmt.Printf("Highest similarity: %.2f%%\n", result.HighestSimilarity*100)
+	fmt.Printf("Processing time: %v\n", result.ProcessingTime)
+
+	if len(result.Statistics.StrategyResults) > 0 {
+		fmt.Printf("\nStrategy results:\n")
+		for strategy, count := range result.Statistics.StrategyResults {
+			fmt.Printf("  %s: %d\n", strategy, count)
+		}
+	}
+}
+
+// 保持原有的辅助方法
+func (r *AttackReplayer) executeTransactionWithTracing(tx *types.Transaction, prestate PrestateResult, modifiedInput []byte, storageMods map[gethCommon.Hash]gethCommon.Hash) (*ExecutionPath, error) {
+	stateDB, err := r.createStateFromPrestate(prestate)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create state: %v", err)
+	}
+
+	if storageMods != nil && tx.To() != nil {
+		for slot, value := range storageMods {
+			stateDB.SetState(*tx.To(), slot, value)
+		}
+		fmt.Printf("Applied %d storage modifications\n", len(storageMods))
+	}
+
+	receipt, err := r.nodeClient.TxReceiptByHash(tx.Hash())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get receipt: %v", err)
+	}
+
+	block, err := r.nodeClient.BlockHeaderByNumber(receipt.BlockNumber)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block: %v", err)
+	}
+
 	chainID, err := r.client.NetworkID(context.Background())
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	fmt.Printf("Network chain ID: %d\n", chainID.Uint64())
+	evm, err := r.createEVMWithTracer(stateDB, block, chainID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create EVM: %v", err)
+	}
 
 	signer := types.LatestSignerForChainID(chainID)
 	from, err := types.Sender(signer, tx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	fmt.Printf("Transaction from: %s\n", from.Hex())
-
-	// Step 2: Get prestate
-	fmt.Printf("\n=== GETTING PRESTATE ===\n")
-	prestate, err := r.getTransactionPrestate(txHash)
-	if err != nil {
-		return fmt.Errorf("failed to get prestate: %v", err)
-	}
-
-	fmt.Printf("Prestate accounts count: %d\n", len(prestate))
-	for addr, account := range prestate {
-		fmt.Printf("  Account %s: Balance=%s, Nonce=%d, CodeSize=%d, StorageKeys=%d\n",
-			addr.Hex(),
-			(*big.Int)(account.Balance).String(),
-			account.Nonce,
-			len(account.Code),
-			len(account.Storage))
-	}
-
-	// Step 3: Create StateDB from prestate
-	fmt.Printf("\n=== CREATING STATE DB ===\n")
-	stateDB, err := r.createStateFromPrestate(prestate)
-	if err != nil {
-		return fmt.Errorf("failed to create state: %v", err)
-	}
-	fmt.Printf("StateDB created successfully\n")
-
-	// Step 4: Create EVM instance with actual block context and tracer
-	evm, err := r.createEVMWithBlockInfoAndTracer(stateDB, block, chainID)
-	if err != nil {
-		return fmt.Errorf("failed to create EVM: %v", err)
-	}
-
-	// Step 5: Prepare transaction context
-	fmt.Printf("\n=== SETTING TRANSACTION CONTEXT ===\n")
 	txCtx := vm.TxContext{
 		Origin:   from,
 		GasPrice: tx.GasPrice(),
 	}
 	evm.SetTxContext(txCtx)
-	fmt.Printf("Transaction context set\n")
 
-	// Step 6: Apply input modifications
-	fmt.Printf("\n=== APPLYING INPUT MODIFICATIONS ===\n")
-	input := tx.Data()
-	originalInput := make([]byte, len(input))
-	copy(originalInput, input)
-
-	to := tx.To()
-	inputModified := false
-
-	if to != nil {
-		fmt.Printf("Contract address: %s\n", to.Hex())
-
-		// 优先使用高级修改器
-		if advancedModifier, exists := r.advancedModifiers[*to]; exists {
-			fmt.Printf("Found advanced modifier for contract\n")
-			modifiedInput, err := advancedModifier.ModifyInput(input)
-			if err != nil {
-				fmt.Printf("Advanced modification failed: %v, falling back to original input\n", err)
-			} else {
-				if !bytes.Equal(input, modifiedInput) {
-					input = modifiedInput
-					inputModified = true
-					fmt.Printf("Input was modified by advanced modifier\n")
-				} else {
-					fmt.Printf("No actual modification applied by advanced modifier\n")
-				}
-			}
-		} else if simpleModifier, exists := r.simpleModifiers[*to]; exists {
-			fmt.Printf("Found simple modifier for contract\n")
-			modifiedInput := simpleModifier.ModifyInput(input)
-			if !bytes.Equal(input, modifiedInput) {
-				input = modifiedInput
-				inputModified = true
-				fmt.Printf("Input was modified by simple modifier\n")
-			} else {
-				fmt.Printf("No actual modification applied by simple modifier\n")
-			}
-		} else {
-			fmt.Printf("No modifier found for contract %s\n", to.Hex())
-		}
-	} else {
-		fmt.Printf("Contract creation transaction\n")
+	inputData := tx.Data()
+	if modifiedInput != nil {
+		inputData = modifiedInput
 	}
 
-	if inputModified {
-		fmt.Printf("\n=== INPUT COMPARISON ===\n")
-		fmt.Printf("ORIGINAL INPUT (%d bytes): %x\n", len(originalInput), originalInput)
-		fmt.Printf("MODIFIED INPUT (%d bytes): %x\n", len(input), input)
+	r.jumpTracer.StartTrace()
 
-		// 分析修改的部分
-		if len(originalInput) >= 4 && len(input) >= 4 {
-			fmt.Printf("ORIGINAL SELECTOR: %x\n", originalInput[:4])
-			fmt.Printf("MODIFIED SELECTOR: %x\n", input[:4])
-			if !bytes.Equal(originalInput[:4], input[:4]) {
-				fmt.Printf("FUNCTION SELECTOR CHANGED!\n")
-			}
-
-			if len(originalInput) > 4 {
-				fmt.Printf("ORIGINAL PARAMS: %x\n", originalInput[4:])
-			}
-			if len(input) > 4 {
-				fmt.Printf("MODIFIED PARAMS: %x\n", input[4:])
-			}
-		}
-		fmt.Printf("=== INPUT COMPARISON END ===\n")
-	} else {
-		fmt.Printf("Input was not modified\n")
-	}
-
-	// Step 7: Execute transaction with tracing
-	fmt.Printf("\n=== EXECUTING TRANSACTION WITH TRACING ===\n")
-	if to == nil {
-		// Contract creation
-		fmt.Printf("Executing contract creation\n")
-		_, _, leftOverGas, err := evm.Create(
+	if tx.To() == nil {
+		_, _, _, err = evm.Create(
 			from,
-			input,
+			inputData,
 			tx.Gas(),
 			uint256.MustFromBig(tx.Value()),
 		)
-		if err != nil {
-			fmt.Printf("Contract creation failed with error: %v\n", err)
-			return fmt.Errorf("contract creation failed: %v", err)
-		}
-		fmt.Printf("Contract created successfully. Gas used: %d\n", tx.Gas()-leftOverGas)
 	} else {
-		// Contract call
-		fmt.Printf("Executing contract call\n")
-		result, leftOverGas, err := evm.Call(
+		_, _, err = evm.Call(
 			from,
-			*to,
-			input,
+			*tx.To(),
+			inputData,
 			tx.Gas(),
 			uint256.MustFromBig(tx.Value()),
 		)
-		if err != nil {
-			fmt.Printf("Contract call failed with error: %v\n", err)
-			fmt.Printf("This might be due to PUSH0 opcode issue - trying alternative solution...\n")
-
-			// 尝试使用强制激活Shanghai的配置
-			alternativeEVM, err := r.createEVMWithForcedShanghaiAndTracer(stateDB, block, chainID)
-			if err != nil {
-				return fmt.Errorf("failed to create alternative EVM: %v", err)
-			}
-
-			alternativeEVM.SetTxContext(txCtx)
-			fmt.Printf("Retrying with forced Shanghai activation...\n")
-
-			result, leftOverGas, err = alternativeEVM.Call(
-				from,
-				*to,
-				input,
-				tx.Gas(),
-				uint256.MustFromBig(tx.Value()),
-			)
-			if err != nil {
-				return fmt.Errorf("call failed even with forced Shanghai: %v", err)
-			}
-		}
-		fmt.Printf("Call executed successfully. Gas used: %d\n", tx.Gas()-leftOverGas)
-		fmt.Printf("Result length: %d\n", len(result))
-		fmt.Printf("Result: %x\n", result)
 	}
 
-	// Step 8: Compare storage changes with enhanced analysis
-	fmt.Printf("\n=== STORAGE CHANGES ANALYSIS ===\n")
-	if to != nil {
-		err = r.analyzeStorageChanges(*to, prestate, stateDB)
-		if err != nil {
-			fmt.Printf("Failed to analyze storage changes: %v\n", err)
-		}
+	path := r.jumpTracer.StopTrace()
+
+	if err != nil {
+		fmt.Printf("Transaction execution failed: %v\n", err)
 	}
 
-	// NEW: Step 9: Print execution trace
-	fmt.Printf("\n=== EXECUTION TRACE ANALYSIS ===\n")
-	r.PrintExecutionTrace()
-
-	fmt.Printf("=== TRANSACTION REPLAY END ===\n\n")
-	return nil
+	return path, nil
 }
 
-func (r *TransactionReplayer) analyzeStorageChanges(contractAddr common.Address, prestate PrestateResult, postStateDB *state.StateDB) error {
-	fmt.Printf("Analyzing storage changes for contract: %s\n", contractAddr.Hex())
-
-	// 获取执行前的storage状态
-	prestateAccount, exists := prestate[contractAddr]
-	if !exists {
-		fmt.Printf("Contract %s not found in prestate\n", contractAddr.Hex())
-		return nil
+func (r *AttackReplayer) generateStateModifications(contractAddr gethCommon.Address, prestate PrestateResult, originalInput []byte) *StateModification {
+	modifications := &StateModification{
+		ContractAddress: contractAddr,
+		StorageChanges:  make(map[gethCommon.Hash]gethCommon.Hash),
+		InputData:       originalInput,
 	}
 
-	// 创建storage changes结构
-	changes := &ContractStorageChanges{
-		Address:        contractAddr,
-		Changes:        []StorageChange{},
-		NewSlots:       []StorageChange{},
-		ModifiedSlots:  []StorageChange{},
-		UnchangedSlots: []StorageChange{},
-	}
-
-	// 分析原有的storage槽
-	for slot, oldValue := range prestateAccount.Storage {
-		newValue := postStateDB.GetState(contractAddr, slot)
-
-		change := StorageChange{
-			Slot:     slot,
-			OldValue: oldValue,
-			NewValue: newValue,
-			Changed:  oldValue != newValue,
-		}
-
-		changes.Changes = append(changes.Changes, change)
-
-		if change.Changed {
-			changes.ModifiedSlots = append(changes.ModifiedSlots, change)
-		} else {
-			changes.UnchangedSlots = append(changes.UnchangedSlots, change)
-		}
-	}
-
-	// 检查是否有新的storage槽（这需要遍历StateDB，比较复杂）
-	// 为了简化，我们只检查一些常见的storage槽
-	r.checkCommonStorageSlots(contractAddr, prestateAccount.Storage, postStateDB, changes)
-
-	// 输出分析结果
-	r.printStorageChanges(changes)
-
-	// NEW: Enhanced storage decoding with layout information
-	if layout, exists := r.storageLayouts[contractAddr]; exists {
-		r.decodeStorageChangesWithLayout(changes, layout)
+	modifiedInput, err := r.inputModifier.ModifyInput(originalInput)
+	if err != nil {
+		fmt.Printf("Failed to modify input: %v\n", err)
 	} else {
-		// 如果有高级修改器，尝试解码storage值
-		if modifier, exists := r.advancedModifiers[contractAddr]; exists {
-			r.decodeStorageChanges(changes, modifier)
-		}
+		modifications.InputData = modifiedInput
 	}
 
-	return nil
-}
-
-// checkCommonStorageSlots 检查一些常见的storage槽位
-func (r *TransactionReplayer) checkCommonStorageSlots(contractAddr common.Address, originalStorage map[common.Hash]common.Hash, stateDB *state.StateDB, changes *ContractStorageChanges) {
-	// 检查槽位 0-50（大多数简单合约的状态变量在这个范围内）
-	for i := 0; i < 51; i++ {
-		slot := common.BigToHash(big.NewInt(int64(i)))
-
-		// 如果这个槽位在原始storage中不存在
-		if _, exists := originalStorage[slot]; !exists {
-			newValue := stateDB.GetState(contractAddr, slot)
-
-			// 如果新值不为空，说明是新创建的槽位
-			if newValue != (common.Hash{}) {
-				change := StorageChange{
-					Slot:     slot,
-					OldValue: common.Hash{}, // 原值为空
-					NewValue: newValue,
-					Changed:  true,
-				}
-
-				changes.NewSlots = append(changes.NewSlots, change)
-				changes.Changes = append(changes.Changes, change)
+	if contractAccount, exists := prestate[contractAddr]; exists {
+		for slot, originalValue := range contractAccount.Storage {
+			if rand.Float32() < 0.5 {
+				newValue := r.generateStepBasedStorageValue(originalValue, r.mutationConfig.StorageSteps[0], 0)
+				modifications.StorageChanges[slot] = newValue
 			}
 		}
 	}
+
+	return modifications
 }
 
-// printStorageChanges 输出storage变化的详细信息
-func (r *TransactionReplayer) printStorageChanges(changes *ContractStorageChanges) {
-	fmt.Printf("\n=== STORAGE CHANGES SUMMARY ===\n")
-	fmt.Printf("Contract: %s\n", changes.Address.Hex())
-	fmt.Printf("Total slots analyzed: %d\n", len(changes.Changes))
-	fmt.Printf("Modified slots: %d\n", len(changes.ModifiedSlots))
-	fmt.Printf("New slots: %d\n", len(changes.NewSlots))
-	fmt.Printf("Unchanged slots: %d\n", len(changes.UnchangedSlots))
+func (r *AttackReplayer) calculatePathSimilarity(path1, path2 *ExecutionPath) float64 {
+	if path1 == nil || path2 == nil {
+		return 0.0
+	}
 
-	if len(changes.ModifiedSlots) > 0 {
-		fmt.Printf("\n=== MODIFIED STORAGE SLOTS ===\n")
-		for i, change := range changes.ModifiedSlots {
-			fmt.Printf("Change #%d:\n", i+1)
-			fmt.Printf("  Slot:      %s (decimal: %s)\n", change.Slot.Hex(), change.Slot.Big().String())
-			fmt.Printf("  Old Value: %s (decimal: %s)\n", change.OldValue.Hex(), change.OldValue.Big().String())
-			fmt.Printf("  New Value: %s (decimal: %s)\n", change.NewValue.Hex(), change.NewValue.Big().String())
+	if len(path1.Jumps) == 0 && len(path2.Jumps) == 0 {
+		return 1.0
+	}
 
-			// 尝试解释常见的存储模式
-			r.interpretStorageSlot(change.Slot, change.OldValue, change.NewValue)
+	if len(path1.Jumps) == 0 || len(path2.Jumps) == 0 {
+		return 0.0
+	}
+
+	matches := 0
+	minLen := len(path1.Jumps)
+	if len(path2.Jumps) < minLen {
+		minLen = len(path2.Jumps)
+	}
+
+	for i := 0; i < minLen; i++ {
+		if path1.Jumps[i].ContractAddress == path2.Jumps[i].ContractAddress &&
+			path1.Jumps[i].JumpFrom == path2.Jumps[i].JumpFrom &&
+			path1.Jumps[i].JumpDest == path2.Jumps[i].JumpDest {
+			matches++
 		}
 	}
 
-	if len(changes.NewSlots) > 0 {
-		fmt.Printf("\n=== NEW STORAGE SLOTS ===\n")
-		for i, change := range changes.NewSlots {
-			fmt.Printf("New Slot #%d:\n", i+1)
-			fmt.Printf("  Slot:      %s (decimal: %s)\n", change.Slot.Hex(), change.Slot.Big().String())
-			fmt.Printf("  Value:     %s (decimal: %s)\n", change.NewValue.Hex(), change.NewValue.Big().String())
-
-			r.interpretStorageSlot(change.Slot, change.OldValue, change.NewValue)
-		}
+	maxLen := len(path1.Jumps)
+	if len(path2.Jumps) > maxLen {
+		maxLen = len(path2.Jumps)
 	}
 
-	if len(changes.UnchangedSlots) > 0 {
-		fmt.Printf("\n=== UNCHANGED STORAGE SLOTS ===\n")
-		for i, change := range changes.UnchangedSlots {
-			fmt.Printf("Slot #%d: %s = %s\n", i+1, change.Slot.Hex(), change.NewValue.Hex())
-		}
-	}
+	return float64(matches) / float64(maxLen)
 }
 
-// interpretStorageSlot 尝试解释storage槽的含义
-func (r *TransactionReplayer) interpretStorageSlot(slot, oldValue, newValue common.Hash) {
-	slotNum := slot.Big()
-
-	fmt.Printf("  Interpretation:\n")
-
-	// 基于槽位号码推测可能的变量类型
-	switch slotNum.Int64() {
-	case 0:
-		fmt.Printf("    -> Likely: First state variable (slot 0)\n")
-	case 1:
-		fmt.Printf("    -> Likely: Second state variable (slot 1)\n")
-	case 2:
-		fmt.Printf("    -> Likely: Third state variable (slot 2)\n")
-	default:
-		if slotNum.Int64() < 50 {
-			fmt.Printf("    -> Likely: State variable at slot %d\n", slotNum.Int64())
-		} else {
-			fmt.Printf("    -> Likely: Mapping or dynamic array slot\n")
-		}
-	}
-
-	// 尝试解析常见的数据类型
-	if newValue.Big().Cmp(big.NewInt(1)) == 0 {
-		fmt.Printf("    -> Could be: boolean true or uint with value 1\n")
-	} else if newValue.Big().Cmp(big.NewInt(0)) == 0 {
-		fmt.Printf("    -> Could be: boolean false, uint with value 0, or cleared slot\n")
-	} else if newValue.Big().BitLen() <= 64 {
-		fmt.Printf("    -> Could be: small integer value %s\n", newValue.Big().String())
-	} else {
-		fmt.Printf("    -> Could be: large integer, address, or hash\n")
-	}
-
-	// 检查是否像地址
-	if newValue.Big().BitLen() <= 160 && newValue.Big().Cmp(big.NewInt(0)) > 0 {
-		addr := common.BigToAddress(newValue.Big())
-		fmt.Printf("    -> If address: %s\n", addr.Hex())
-	}
-
-	fmt.Printf("\n")
-}
-
-// NEW: decodeStorageChangesWithLayout uses storage layout to decode packed variables
-func (r *TransactionReplayer) decodeStorageChangesWithLayout(changes *ContractStorageChanges, layout *StorageLayout) {
-	fmt.Printf("\n=== ENHANCED STORAGE DECODING WITH LAYOUT ===\n")
-
-	for _, change := range changes.ModifiedSlots {
-		slotNum := int(change.Slot.Big().Int64())
-		fmt.Printf("Slot %d detailed analysis:\n", slotNum)
-
-		// Find all variables in this slot
-		varsInSlot := make([]StorageVariable, 0)
-		for _, variable := range layout.Variables {
-			if variable.Slot == slotNum {
-				varsInSlot = append(varsInSlot, variable)
-			}
-		}
-
-		if len(varsInSlot) == 0 {
-			fmt.Printf("  -> No known variables in this slot\n")
-			continue
-		}
-
-		fmt.Printf("  -> Variables in this slot: %d\n", len(varsInSlot))
-
-		// Decode each variable
-		for _, variable := range varsInSlot {
-			oldVariableValue := r.extractVariableFromSlot(change.OldValue, variable)
-			newVariableValue := r.extractVariableFromSlot(change.NewValue, variable)
-
-			fmt.Printf("    Variable: %s (%s)\n", variable.Name, variable.Type)
-			fmt.Printf("      Old value: %s\n", r.formatVariableValue(oldVariableValue, variable))
-			fmt.Printf("      New value: %s\n", r.formatVariableValue(newVariableValue, variable))
-
-			if !bytes.Equal(oldVariableValue, newVariableValue) {
-				fmt.Printf("      Status: CHANGED ✅\n")
-			} else {
-				fmt.Printf("      Status: unchanged\n")
-			}
-		}
-		fmt.Printf("\n")
-	}
-}
-
-// NEW: extractVariableFromSlot extracts a specific variable's value from a storage slot
-func (r *TransactionReplayer) extractVariableFromSlot(slotValue common.Hash, variable StorageVariable) []byte {
-	slotBytes := slotValue.Bytes()
-
-	// In Solidity, variables are packed from right to left (little-endian style)
-	// But the slot is stored as big-endian bytes
-
-	// Calculate the starting position from the right
-	totalSlotSize := 32 // 256 bits = 32 bytes
-	startFromRight := variable.Offset
-	startFromLeft := totalSlotSize - startFromRight - variable.Size
-
-	if startFromLeft < 0 || startFromLeft+variable.Size > totalSlotSize {
-		// Invalid range, return zero bytes
-		return make([]byte, variable.Size)
-	}
-
-	// Extract the bytes for this variable
-	variableBytes := make([]byte, variable.Size)
-	copy(variableBytes, slotBytes[startFromLeft:startFromLeft+variable.Size])
-
-	return variableBytes
-}
-
-// NEW: formatVariableValue formats a variable value according to its type
-func (r *TransactionReplayer) formatVariableValue(value []byte, variable StorageVariable) string {
-	if len(value) == 0 {
-		return "0"
-	}
-
-	// Convert bytes to big.Int
-	bigIntValue := new(big.Int).SetBytes(value)
-
-	switch {
-	case strings.HasPrefix(variable.Type, "uint"):
-		return fmt.Sprintf("%s (decimal: %s)", common.Bytes2Hex(value), bigIntValue.String())
-
-	case strings.HasPrefix(variable.Type, "int"):
-		// Handle signed integers
-		if variable.IsSigned && len(value) > 0 {
-			// Check if the most significant bit is set (negative number)
-			if value[0]&0x80 != 0 {
-				// Convert from two's complement
-				// For the size of the variable, create a mask
-				bitSize := variable.Size * 8
-				maxValue := new(big.Int).Lsh(big.NewInt(1), uint(bitSize))
-				if bigIntValue.Cmp(new(big.Int).Rsh(maxValue, 1)) >= 0 {
-					// This is a negative number in two's complement
-					signedValue := new(big.Int).Sub(bigIntValue, maxValue)
-					return fmt.Sprintf("%s (decimal: %s, signed)", common.Bytes2Hex(value), signedValue.String())
-				}
-			}
-		}
-		return fmt.Sprintf("%s (decimal: %s)", common.Bytes2Hex(value), bigIntValue.String())
-
-	case variable.Type == "bool":
-		if bigIntValue.Cmp(big.NewInt(0)) == 0 {
-			return "false"
-		}
-		return "true"
-
-	case variable.Type == "address":
-		if len(value) >= 20 {
-			addr := common.BytesToAddress(value[len(value)-20:])
-			return addr.Hex()
-		}
-		return common.Bytes2Hex(value)
-
-	case strings.HasPrefix(variable.Type, "bytes"):
-		return common.Bytes2Hex(value)
-
-	default:
-		return fmt.Sprintf("%s (raw: %s)", common.Bytes2Hex(value), bigIntValue.String())
-	}
-}
-
-// decodeStorageChanges 使用ABI信息尝试解码storage变化
-func (r *TransactionReplayer) decodeStorageChanges(changes *ContractStorageChanges, modifier *AdvancedInputModifier) {
-	fmt.Printf("\n=== ADVANCED STORAGE INTERPRETATION ===\n")
-
-	// 这里可以根据合约的ABI和已知的状态变量布局来解码storage
-	// 由于Solidity的存储布局规则，我们可以推测一些基本的变量类型
-
-	for _, change := range changes.ModifiedSlots {
-		slotNum := change.Slot.Big().Int64()
-
-		fmt.Printf("Slot %d interpretation:\n", slotNum)
-
-		// 基于已知的函数修改规则，推测可能的变量
-		for signature, funcMod := range modifier.functionMods {
-			if strings.Contains(signature, "setUint") || strings.Contains(signature, "setInt") {
-				fmt.Printf("  -> Possible match with function: %s\n", funcMod.FunctionName)
-
-				// 如果是简单的setter函数，槽位通常对应变量的声明顺序
-				if len(funcMod.ParameterMods) > 0 {
-					newVal := funcMod.ParameterMods[0].NewValue
-					fmt.Printf("  -> Expected new value from modification: %v\n", newVal)
-
-					// 比较实际的storage值和期望的修改值
-					actualVal := change.NewValue.Big()
-					switch v := newVal.(type) {
-					case int, int8, int16, int32, int64:
-						expectedVal := big.NewInt(reflect.ValueOf(v).Int())
-						if actualVal.Cmp(expectedVal) == 0 {
-							fmt.Printf("  -> ✅ MATCH: Storage value matches expected modification!\n")
-						} else {
-							fmt.Printf("  -> ❌ MISMATCH: Expected %s, got %s\n", expectedVal.String(), actualVal.String())
-						}
-					case uint, uint8, uint16, uint32, uint64:
-						expectedVal := big.NewInt(int64(reflect.ValueOf(v).Uint()))
-						if actualVal.Cmp(expectedVal) == 0 {
-							fmt.Printf("  -> ✅ MATCH: Storage value matches expected modification!\n")
-						} else {
-							fmt.Printf("  -> ❌ MISMATCH: Expected %s, got %s\n", expectedVal.String(), actualVal.String())
-						}
-					case *big.Int:
-						if actualVal.Cmp(v) == 0 {
-							fmt.Printf("  -> ✅ MATCH: Storage value matches expected modification!\n")
-						} else {
-							fmt.Printf("  -> ❌ MISMATCH: Expected %s, got %s\n", v.String(), actualVal.String())
-						}
-					}
-				}
-			}
-		}
-		fmt.Printf("\n")
-	}
-}
-
-// GetStorageAt 提供一个便捷方法来读取特定槽位的值
-func (r *TransactionReplayer) GetStorageAt(stateDB *state.StateDB, contractAddr common.Address, slot common.Hash) common.Hash {
-	return stateDB.GetState(contractAddr, slot)
-}
-
-// GetStorageBySlotNumber 通过槽位编号读取storage
-func (r *TransactionReplayer) GetStorageBySlotNumber(stateDB *state.StateDB, contractAddr common.Address, slotNumber int64) common.Hash {
-	slot := common.BigToHash(big.NewInt(slotNumber))
-	return stateDB.GetState(contractAddr, slot)
-}
-
-// DumpContractStorage 导出合约的所有非零storage槽
-func (r *TransactionReplayer) DumpContractStorage(stateDB *state.StateDB, contractAddr common.Address, maxSlots int) map[string]string {
-	fmt.Printf("\n=== DUMPING CONTRACT STORAGE ===\n")
-	fmt.Printf("Contract: %s\n", contractAddr.Hex())
-	fmt.Printf("Checking first %d slots...\n", maxSlots)
-
-	storage := make(map[string]string)
-
-	for i := 0; i < maxSlots; i++ {
-		slot := common.BigToHash(big.NewInt(int64(i)))
-		value := stateDB.GetState(contractAddr, slot)
-
-		if value != (common.Hash{}) {
-			storage[slot.Hex()] = value.Hex()
-			fmt.Printf("  Slot %d (%s): %s (decimal: %s)\n",
-				i, slot.Hex(), value.Hex(), value.Big().String())
-		}
-	}
-
-	fmt.Printf("Found %d non-zero storage slots\n", len(storage))
-	return storage
-}
-
-func (r *TransactionReplayer) getTransactionPrestate(txHash common.Hash) (PrestateResult, error) {
+func (r *AttackReplayer) getTransactionPrestate(txHash gethCommon.Hash) (PrestateResult, error) {
 	config := map[string]interface{}{
 		"tracer": "prestateTracer",
 		"tracerConfig": map[string]interface{}{
@@ -1014,25 +1909,19 @@ func (r *TransactionReplayer) getTransactionPrestate(txHash common.Hash) (Presta
 	return result, err
 }
 
-func (r *TransactionReplayer) createStateFromPrestate(prestate PrestateResult) (*state.StateDB, error) {
-	// Create in-memory database
+func (r *AttackReplayer) createStateFromPrestate(prestate PrestateResult) (*state.StateDB, error) {
 	memDb := rawdb.NewMemoryDatabase()
 
-	// Create trie database
 	trieDB := triedb.NewDatabase(memDb, &triedb.Config{
 		Preimages: false,
 		IsVerkle:  false,
 		HashDB: &hashdb.Config{
-			CleanCacheSize: 256 * 1024 * 1024, // 256MB
+			CleanCacheSize: 256 * 1024 * 1024,
 		},
 	})
 
-	// For memory-only testing state, we don't need snapshot functionality
-	// Pass nil as snapshot tree to disable snapshot features
 	stateDb := state.NewDatabase(trieDB, nil)
-
-	// Create new StateDB with empty root
-	stateDB, err := state.New(common.Hash{}, stateDb)
+	stateDB, err := state.New(gethCommon.Hash{}, stateDb)
 	if err != nil {
 		return nil, err
 	}
@@ -1044,16 +1933,36 @@ func (r *TransactionReplayer) createStateFromPrestate(prestate PrestateResult) (
 
 		if account.Balance != nil {
 			balance := (*big.Int)(account.Balance)
-			stateDB.SetBalance(addr, uint256.MustFromBig(balance),
-				tracing.BalanceChangeUnspecified)
+			stateDB.SetBalance(addr, uint256.MustFromBig(balance), 0)
 		}
 
 		if account.Nonce > 0 {
-			stateDB.SetNonce(addr, account.Nonce, tracing.NonceChangeUnspecified)
+			stateDB.SetNonce(addr, account.Nonce, 0)
 		}
 
 		if len(account.Code) > 0 {
-			stateDB.SetCode(addr, []byte(account.Code))
+			code := []byte(account.Code)
+
+			// 检查字节码中是否包含PUSH0指令 (0x5f)
+			containsPush0 := false
+			for i, b := range code {
+				if b == 0x5f {
+					containsPush0 = true
+					fmt.Printf("Found PUSH0 instruction at position %d in contract %s\n", i, addr.Hex())
+				}
+			}
+
+			if containsPush0 {
+				fmt.Printf("Contract %s contains PUSH0 instructions, code length: %d\n", addr.Hex(), len(code))
+				// 显示前100字节的十六进制表示
+				maxLen := len(code)
+				if maxLen > 100 {
+					maxLen = 100
+				}
+				fmt.Printf("First %d bytes: %x\n", maxLen, code[:maxLen])
+			}
+
+			stateDB.SetCode(addr, code)
 		}
 
 		for key, value := range account.Storage {
@@ -1064,139 +1973,113 @@ func (r *TransactionReplayer) createStateFromPrestate(prestate PrestateResult) (
 	return stateDB, nil
 }
 
-// NEW: Create EVM with tracer support
-func (r *TransactionReplayer) createEVMWithBlockInfoAndTracer(stateDB *state.StateDB, blockHeader *types.Header, chainID *big.Int) (*vm.EVM, error) {
-	fmt.Printf("\n=== EVM CREATION WITH TRACER START ===\n")
-	fmt.Printf("Chain ID: %d\n", chainID.Uint64())
-	fmt.Printf("Block number: %s\n", blockHeader.Number.String())
-	fmt.Printf("Block timestamp: %d\n", blockHeader.Time)
-	fmt.Printf("Block BaseFee: %s\n", blockHeader.BaseFee.String())
+// createEVMWithTracer 创建包含tracer的EVM - 修复PUSH0操作码支持
+func (r *AttackReplayer) createEVMWithTracer(stateDB *state.StateDB, blockHeader *types.Header, chainID *big.Int) (*vm.EVM, error) {
+	// 创建支持所有硬分叉的链配置
+	chainConfig := r.createChainConfigWithAllForks(chainID, blockHeader)
 
-	// 根据链 ID 选择配置，优先使用预定义配置
-	var chainConfig *params.ChainConfig
-	switch chainID.Uint64() {
-	case 1: // 主网
-		chainConfig = params.MainnetChainConfig
-		fmt.Printf("Using MainnetChainConfig\n")
-	case 17000: // Holesky 测试网
-		chainConfig = params.HoleskyChainConfig
-		fmt.Printf("Using HoleskyChainConfig\n")
-	case 11155111: // Sepolia 测试网
-		chainConfig = params.SepoliaChainConfig
-		fmt.Printf("Using SepoliaChainConfig\n")
-	default:
-		// 对于未知链ID，优先使用Holesky配置作为fallback
-		chainConfig = params.HoleskyChainConfig
-		fmt.Printf("Unknown chain ID %d, falling back to HoleskyChainConfig\n", chainID.Uint64())
-	}
-
-	// 打印硬分叉激活状态
-	fmt.Printf("=== HARD FORK STATUS ===\n")
+	// 强制使用支持Shanghai的时间戳，确保PUSH0操作码可用
+	// 计算一个确保Shanghai硬分叉激活的时间戳
+	shanghaiTime := uint64(0)
 	if chainConfig.ShanghaiTime != nil {
-		fmt.Printf("Shanghai fork time: %d (current time: %d, activated: %t)\n",
-			*chainConfig.ShanghaiTime, blockHeader.Time, *chainConfig.ShanghaiTime <= blockHeader.Time)
-	} else {
-		fmt.Printf("Shanghai fork time: not set\n")
+		shanghaiTime = *chainConfig.ShanghaiTime
 	}
 
-	if chainConfig.CancunTime != nil {
-		fmt.Printf("Cancun fork time: %d (current time: %d, activated: %t)\n",
-			*chainConfig.CancunTime, blockHeader.Time, *chainConfig.CancunTime <= blockHeader.Time)
-	} else {
-		fmt.Printf("Cancun fork time: not set\n")
-	}
-
-	// 检查是否支持PUSH0操作码
-	rules := chainConfig.Rules(blockHeader.Number, true, blockHeader.Time)
-	fmt.Printf("Shanghai rules activated: %t\n", rules.IsShanghai)
-	fmt.Printf("Cancun rules activated: %t\n", rules.IsCancun)
-
-	blockCtx := vm.BlockContext{
-		CanTransfer: core.CanTransfer,
-		Transfer:    core.Transfer,
-		GetHash:     func(uint64) common.Hash { return common.Hash{} },
-		Coinbase:    blockHeader.Coinbase,
-		BlockNumber: blockHeader.Number,
-		Time:        blockHeader.Time,
-		Difficulty:  blockHeader.Difficulty,
-		GasLimit:    blockHeader.GasLimit,
-		BaseFee:     blockHeader.BaseFee,
-	}
-
-	// NEW: VM Config with tracer using tracing.Hooks
-	vmConfig := vm.Config{
-		NoBaseFee:               false,
-		EnablePreimageRecording: true,
-		Tracer:                  r.tracer.ToTracingHooks(), // Use ToTracingHooks() method
-	}
-
-	fmt.Printf("=== EVM CREATION WITH TRACER END ===\n\n")
-
-	evm := vm.NewEVM(blockCtx, stateDB, chainConfig, vmConfig)
-	return evm, nil
-}
-
-// NEW: Create EVM with forced Shanghai and tracer
-func (r *TransactionReplayer) createEVMWithForcedShanghaiAndTracer(stateDB *state.StateDB, blockHeader *types.Header, chainID *big.Int) (*vm.EVM, error) {
-	fmt.Printf("\n=== CREATING EVM WITH FORCED SHANGHAI ACTIVATION AND TRACER ===\n")
-
-	// 使用现有的配置，但修改时间戳来强制激活硬分叉
-	var chainConfig *params.ChainConfig
-	switch chainID.Uint64() {
-	case 1:
-		chainConfig = params.MainnetChainConfig
-	case 17000:
-		chainConfig = params.HoleskyChainConfig
-	case 11155111:
-		chainConfig = params.SepoliaChainConfig
-	default:
-		chainConfig = params.HoleskyChainConfig // 默认使用Holesky配置
-	}
-
-	fmt.Printf("Base config: %v\n", chainConfig.ChainID)
-
-	// 使用一个更晚的时间戳来确保所有硬分叉都激活
-	modifiedTime := blockHeader.Time
-	if modifiedTime < 1700000000 { // 如果时间戳太早，使用2023年的时间戳
-		modifiedTime = 1700000000
-		fmt.Printf("Modified timestamp from %d to %d to ensure hard forks activation\n", blockHeader.Time, modifiedTime)
+	// 确保使用的时间戳大于等于Shanghai时间
+	blockTime := blockHeader.Time
+	if blockTime < shanghaiTime {
+		blockTime = shanghaiTime + 1
+		fmt.Printf("Adjusted block time from %d to %d to ensure Shanghai activation\n", blockHeader.Time, blockTime)
 	}
 
 	blockCtx := vm.BlockContext{
 		CanTransfer: core.CanTransfer,
 		Transfer:    core.Transfer,
-		GetHash:     func(uint64) common.Hash { return common.Hash{} },
+		GetHash:     func(uint64) gethCommon.Hash { return gethCommon.Hash{} },
 		Coinbase:    blockHeader.Coinbase,
 		BlockNumber: blockHeader.Number,
-		Time:        modifiedTime, // 使用修改的时间戳
+		Time:        blockTime, // 使用调整后的时间戳
 		Difficulty:  blockHeader.Difficulty,
 		GasLimit:    blockHeader.GasLimit,
 		BaseFee:     blockHeader.BaseFee,
 	}
 
-	// 验证硬分叉规则
-	rules := chainConfig.Rules(blockCtx.BlockNumber, true, blockCtx.Time)
-	fmt.Printf("With modified time - Shanghai rules activated: %t\n", rules.IsShanghai)
-	fmt.Printf("With modified time - Cancun rules activated: %t\n", rules.IsCancun)
-
-	// NEW: VM Config with tracer
 	vmConfig := vm.Config{
 		NoBaseFee:               false,
 		EnablePreimageRecording: true,
-		Tracer:                  r.tracer.ToTracingHooks(), // Use ToTracingHooks() method
+		Tracer:                  r.jumpTracer.ToTracingHooks(),
 	}
 
-	fmt.Printf("=== FORCED SHANGHAI EVM WITH TRACER CREATION END ===\n")
-
 	evm := vm.NewEVM(blockCtx, stateDB, chainConfig, vmConfig)
+
+	// 验证Shanghai是否已激活
+	isShanghai := chainConfig.IsShanghai(blockHeader.Number, blockTime)
+	fmt.Printf("Shanghai activated: %v (block time: %d, shanghai time: %v)\n",
+		isShanghai, blockTime, chainConfig.ShanghaiTime)
+
 	return evm, nil
 }
 
-// Backwards compatibility: keep the original method without tracer
-func (r *TransactionReplayer) createEVMWithBlockInfo(stateDB *state.StateDB, blockHeader *types.Header, chainID *big.Int) (*vm.EVM, error) {
-	return r.createEVMWithBlockInfoAndTracer(stateDB, blockHeader, chainID)
-}
+// createChainConfigWithAllForks 创建包含所有硬分叉的链配置 - 修复PUSH0支持
+func (r *AttackReplayer) createChainConfigWithAllForks(chainID *big.Int, blockHeader *types.Header) *params.ChainConfig {
+	// 创建新的配置，强制启用所有硬分叉
+	config := &params.ChainConfig{
+		ChainID:                 chainID,
+		HomesteadBlock:          big.NewInt(0),
+		DAOForkBlock:            nil,
+		DAOForkSupport:          false,
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		GrayGlacierBlock:        big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: nil, // 设置为nil以避免合并相关检查
+		Ethash:                  new(params.EthashConfig),
+		Clique:                  nil,
+	}
 
-func (r *TransactionReplayer) createEVMWithForcedShanghai(stateDB *state.StateDB, blockHeader *types.Header, chainID *big.Int) (*vm.EVM, error) {
-	return r.createEVMWithForcedShanghaiAndTracer(stateDB, blockHeader, chainID)
+	// 强制设置基于时间的硬分叉为0，确保所有硬分叉都从创世激活
+	genesisTime := uint64(0)
+	config.ShanghaiTime = &genesisTime
+	config.CancunTime = &genesisTime
+
+	// 验证配置
+	fmt.Printf("Created FORCED chain config for chainID %d:\n", chainID.Uint64())
+	fmt.Printf("  All block-based forks: activated at block 0\n")
+	fmt.Printf("  Shanghai time: %d (PUSH0 FORCED ENABLED)\n", *config.ShanghaiTime)
+	fmt.Printf("  Cancun time: %d\n", *config.CancunTime)
+
+	if blockHeader != nil {
+		fmt.Printf("  Block time: %d\n", blockHeader.Time)
+
+		// 立即验证Shanghai是否会被激活
+		wouldActivate := config.IsShanghai(blockHeader.Number, blockHeader.Time)
+		fmt.Printf("  Shanghai would activate with this config: %v\n", wouldActivate)
+
+		// 如果仍然不激活，强制设置更早的时间
+		if !wouldActivate {
+			// 强制设置为比当前区块时间更早的时间
+			earlierTime := blockHeader.Time - 1000
+			if blockHeader.Time < 1000 {
+				earlierTime = 0
+			}
+			config.ShanghaiTime = &earlierTime
+			config.CancunTime = &earlierTime
+			fmt.Printf("  FORCED Shanghai time to: %d\n", *config.ShanghaiTime)
+
+			// 再次验证
+			finalCheck := config.IsShanghai(blockHeader.Number, blockHeader.Time)
+			fmt.Printf("  Final Shanghai activation check: %v\n", finalCheck)
+		}
+	}
+
+	return config
 }

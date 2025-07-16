@@ -5,519 +5,1055 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 	"math/big"
 	"reflect"
 	"strings"
 )
 
-// AdvancedInputModifier handles both function selector and parameter modifications
-type AdvancedInputModifier struct {
-	contractABI  abi.ABI
-	functionMods map[string]*FunctionModification  // key: function signature
-	selectorMods map[[4]byte]*FunctionModification // key: function selector
+// InputModifier modifies transaction input data
+type InputModifier struct {
+	contractABI     abi.ABI
+	modifications   map[[4]byte]*FunctionModification
+	originalInput   []byte
+	originalStorage map[common.Hash]common.Hash
+	modStrategy     ModificationStrategy
+	stepConfig      *StepMutationConfig // 新增：步长变异配置
 }
 
-// NewAdvancedInputModifierFromBinding creates a new AdvancedInputModifier from abigen binding
-func NewAdvancedInputModifierFromBinding(contractMetaData *bind.MetaData) (*AdvancedInputModifier, error) {
-	// 从binding的MetaData获取ABI
-	contractABI, err := contractMetaData.GetAbi()
+// StepMutationConfig 步长变异配置
+type StepMutationConfig struct {
+	IntSteps       []int64  `json:"intSteps"`       // 整数类型步长: [1, 10, 100, -1, -10, -100]
+	UintSteps      []uint64 `json:"uintSteps"`      // 无符号整数步长: [1, 10, 100, 1000]
+	AddressSteps   []int    `json:"addressSteps"`   // 地址变异步长（修改最后几字节）: [1, 2, 5, -1, -2, -5]
+	BytesSteps     []int    `json:"bytesSteps"`     // 字节数组步长: [1, 2, 4, 8]
+	StorageSteps   []int64  `json:"storageSteps"`   // 存储值步长: [1, 5, 10, 100, -1, -5, -10, -100]
+	EnableNearby   bool     `json:"enableNearby"`   // 是否启用附近值变异
+	EnableBoundary bool     `json:"enableBoundary"` // 是否启用边界值
+	MaxChanges     int      `json:"maxChanges"`     // 最大同时变异数量
+}
+
+// DefaultStepMutationConfig 默认步长变异配置
+func DefaultStepMutationConfig() *StepMutationConfig {
+	return &StepMutationConfig{
+		IntSteps:       []int64{1, 10, 100, 1000, -1, -10, -100, -1000, 5, -5},
+		UintSteps:      []uint64{1, 10, 100, 1000, 5, 50, 500},
+		AddressSteps:   []int{1, 2, 5, 10, -1, -2, -5, -10},
+		BytesSteps:     []int{1, 2, 4, 8, 16},
+		StorageSteps:   []int64{1, 10, 100, 1000, -1, -10, -100, -1000, 5, -5, 50, -50},
+		EnableNearby:   true,
+		EnableBoundary: false, // 禁用边界值，专注于步长变异
+		MaxChanges:     3,
+	}
+}
+
+// FunctionModification represents modifications for a specific function
+type FunctionModification struct {
+	FunctionName      string                  `json:"functionName"`
+	FunctionSignature string                  `json:"functionSignature"`
+	ParameterMods     []ParameterModification `json:"parameterMods"`
+}
+
+// ParameterModification represents a parameter modification rule
+type ParameterModification struct {
+	ParameterIndex int         `json:"parameterIndex"`
+	ParameterName  string      `json:"parameterName"`
+	NewValue       interface{} `json:"newValue"`
+	ModType        string      `json:"modType"`   // "step_add", "step_sub", "step_mul", "nearby"
+	StepValue      int64       `json:"stepValue"` // 步长值
+}
+
+// ModificationStrategy 修改策略
+type ModificationStrategy struct {
+	InputStrategy   string  `json:"inputStrategy"`   // "step_based", "nearby_values", "boundary_values"
+	StorageStrategy string  `json:"storageStrategy"` // "step_incremental", "step_proportional", "nearby_original"
+	Aggressiveness  float64 `json:"aggressiveness"`  // 0.0-1.0, 修改的激进程度
+	MaxChanges      int     `json:"maxChanges"`      // 最大修改数量
+}
+
+// SmartModificationSet 智能修改集合
+type SmartModificationSet struct {
+	Variations []ModificationVariation `json:"variations"`
+	Strategy   ModificationStrategy    `json:"strategy"`
+	Original   *OriginalState          `json:"original"`
+}
+
+// OriginalState 原始状态
+type OriginalState struct {
+	InputData []byte                      `json:"inputData"`
+	Storage   map[common.Hash]common.Hash `json:"storage"`
+	Function  *abi.Method                 `json:"function"`
+	Args      []interface{}               `json:"args"`
+}
+
+// NewInputModifier creates a new input modifier from binding metadata
+func NewInputModifier(metaData *bind.MetaData) (*InputModifier, error) {
+	contractABI, err := metaData.GetAbi()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get ABI from binding: %v", err)
+		return nil, fmt.Errorf("failed to get ABI: %v", err)
 	}
 
-	if contractABI == nil {
-		return nil, fmt.Errorf("ABI is nil")
-	}
-
-	return &AdvancedInputModifier{
-		contractABI:  *contractABI,
-		functionMods: make(map[string]*FunctionModification),
-		selectorMods: make(map[[4]byte]*FunctionModification),
+	return &InputModifier{
+		contractABI:   *contractABI,
+		modifications: make(map[[4]byte]*FunctionModification),
+		modStrategy: ModificationStrategy{
+			InputStrategy:   "step_based",
+			StorageStrategy: "step_incremental",
+			Aggressiveness:  0.3,
+			MaxChanges:      5,
+		},
+		stepConfig: DefaultStepMutationConfig(), // 新增：默认步长配置
 	}, nil
 }
 
-// NewAdvancedInputModifier 保留原有的方法用于向后兼容
-func NewAdvancedInputModifier(abiJSON string) (*AdvancedInputModifier, error) {
-	contractABI, err := abi.JSON(strings.NewReader(abiJSON))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse ABI: %v", err)
-	}
-
-	return &AdvancedInputModifier{
-		contractABI:  contractABI,
-		functionMods: make(map[string]*FunctionModification),
-		selectorMods: make(map[[4]byte]*FunctionModification),
-	}, nil
+// SetStepMutationConfig 设置步长变异配置
+func (m *InputModifier) SetStepMutationConfig(config *StepMutationConfig) {
+	m.stepConfig = config
 }
 
-// convertToABIType 根据ABI类型转换值
-func (m *AdvancedInputModifier) convertToABIType(value interface{}, abiType abi.Type) (interface{}, error) {
-	if value == nil {
-		return nil, fmt.Errorf("value is nil")
-	}
+// SetOriginalState 设置原始状态用于智能修改
+func (m *InputModifier) SetOriginalState(inputData []byte, storage map[common.Hash]common.Hash) error {
+	m.originalInput = inputData
+	m.originalStorage = storage
 
-	fmt.Printf("Converting value %v (type: %T) to ABI type: %s\n", value, value, abiType.String())
+	if len(inputData) >= 4 {
+		// 解析原始函数调用
+		var selector [4]byte
+		copy(selector[:], inputData[:4])
 
-	switch abiType.T {
-	case abi.IntTy:
-		return m.convertToInt(value, abiType.Size)
-	case abi.UintTy:
-		return m.convertToUint(value, abiType.Size)
-	case abi.BoolTy:
-		return m.convertToBool(value)
-	case abi.StringTy:
-		return m.convertToString(value)
-	case abi.AddressTy:
-		return m.convertToAddress(value)
-	case abi.BytesTy:
-		return m.convertToBytes(value)
-	case abi.FixedBytesTy:
-		return m.convertToFixedBytes(value, abiType.Size)
-	case abi.SliceTy:
-		return m.convertToSlice(value, abiType)
-	case abi.ArrayTy:
-		return m.convertToArray(value, abiType)
-	default:
-		// 如果无法转换，返回原值
-		fmt.Printf("Warning: unsupported ABI type %s, using original value\n", abiType.String())
-		return value, nil
-	}
-}
-
-// convertToInt 转换为有符号整数
-func (m *AdvancedInputModifier) convertToInt(value interface{}, size int) (interface{}, error) {
-	var bigIntValue *big.Int
-
-	switch v := value.(type) {
-	case *big.Int:
-		bigIntValue = v
-	case int:
-		bigIntValue = big.NewInt(int64(v))
-	case int8:
-		bigIntValue = big.NewInt(int64(v))
-	case int16:
-		bigIntValue = big.NewInt(int64(v))
-	case int32:
-		bigIntValue = big.NewInt(int64(v))
-	case int64:
-		bigIntValue = big.NewInt(v)
-	case uint:
-		bigIntValue = big.NewInt(int64(v))
-	case uint8:
-		bigIntValue = big.NewInt(int64(v))
-	case uint16:
-		bigIntValue = big.NewInt(int64(v))
-	case uint32:
-		bigIntValue = big.NewInt(int64(v))
-	case uint64:
-		bigIntValue = big.NewInt(int64(v))
-	case string:
-		var ok bool
-		bigIntValue, ok = new(big.Int).SetString(v, 0)
-		if !ok {
-			return nil, fmt.Errorf("cannot parse string %s as integer", v)
-		}
-	default:
-		return nil, fmt.Errorf("cannot convert %T to int%d", value, size)
-	}
-
-	// 根据大小返回相应的类型
-	switch size {
-	case 8:
-		if bigIntValue.BitLen() > 7 || bigIntValue.Cmp(big.NewInt(-128)) < 0 || bigIntValue.Cmp(big.NewInt(127)) > 0 {
-			return nil, fmt.Errorf("value %s out of range for int8", bigIntValue.String())
-		}
-		return int8(bigIntValue.Int64()), nil
-	case 16:
-		if bigIntValue.BitLen() > 15 || bigIntValue.Cmp(big.NewInt(-32768)) < 0 || bigIntValue.Cmp(big.NewInt(32767)) > 0 {
-			return nil, fmt.Errorf("value %s out of range for int16", bigIntValue.String())
-		}
-		return int16(bigIntValue.Int64()), nil
-	case 32:
-		if bigIntValue.BitLen() > 31 || bigIntValue.Cmp(big.NewInt(-2147483648)) < 0 || bigIntValue.Cmp(big.NewInt(2147483647)) > 0 {
-			return nil, fmt.Errorf("value %s out of range for int32", bigIntValue.String())
-		}
-		return int32(bigIntValue.Int64()), nil
-	case 64:
-		return bigIntValue.Int64(), nil
-	case 256:
-		return bigIntValue, nil
-	default:
-		return nil, fmt.Errorf("unsupported int size: %d", size)
-	}
-}
-
-// convertToUint 转换为无符号整数
-func (m *AdvancedInputModifier) convertToUint(value interface{}, size int) (interface{}, error) {
-	var bigIntValue *big.Int
-
-	switch v := value.(type) {
-	case *big.Int:
-		bigIntValue = v
-	case int:
-		bigIntValue = big.NewInt(int64(v))
-	case int8:
-		bigIntValue = big.NewInt(int64(v))
-	case int16:
-		bigIntValue = big.NewInt(int64(v))
-	case int32:
-		bigIntValue = big.NewInt(int64(v))
-	case int64:
-		bigIntValue = big.NewInt(v)
-	case uint:
-		bigIntValue = big.NewInt(int64(v))
-	case uint8:
-		bigIntValue = big.NewInt(int64(v))
-	case uint16:
-		bigIntValue = big.NewInt(int64(v))
-	case uint32:
-		bigIntValue = big.NewInt(int64(v))
-	case uint64:
-		bigIntValue = new(big.Int).SetUint64(v)
-	case string:
-		var ok bool
-		bigIntValue, ok = new(big.Int).SetString(v, 0)
-		if !ok {
-			return nil, fmt.Errorf("cannot parse string %s as integer", v)
-		}
-	default:
-		return nil, fmt.Errorf("cannot convert %T to uint%d", value, size)
-	}
-
-	if bigIntValue.Sign() < 0 {
-		return nil, fmt.Errorf("negative value %s cannot be converted to uint%d", bigIntValue.String(), size)
-	}
-
-	// 根据大小返回相应的类型
-	switch size {
-	case 8:
-		if bigIntValue.Cmp(big.NewInt(255)) > 0 {
-			return nil, fmt.Errorf("value %s out of range for uint8", bigIntValue.String())
-		}
-		return uint8(bigIntValue.Uint64()), nil
-	case 16:
-		if bigIntValue.Cmp(big.NewInt(65535)) > 0 {
-			return nil, fmt.Errorf("value %s out of range for uint16", bigIntValue.String())
-		}
-		return uint16(bigIntValue.Uint64()), nil
-	case 32:
-		if bigIntValue.Cmp(big.NewInt(4294967295)) > 0 {
-			return nil, fmt.Errorf("value %s out of range for uint32", bigIntValue.String())
-		}
-		return uint32(bigIntValue.Uint64()), nil
-	case 64:
-		maxUint64 := new(big.Int).SetUint64(^uint64(0))
-		if bigIntValue.Cmp(maxUint64) > 0 {
-			return nil, fmt.Errorf("value %s out of range for uint64", bigIntValue.String())
-		}
-		return bigIntValue.Uint64(), nil
-	case 128:
-		// uint128 通常用 *big.Int 表示
-		maxUint128 := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 128), big.NewInt(1))
-		if bigIntValue.Cmp(maxUint128) > 0 {
-			return nil, fmt.Errorf("value %s out of range for uint128", bigIntValue.String())
-		}
-		return bigIntValue, nil
-	case 256:
-		return bigIntValue, nil
-	default:
-		return nil, fmt.Errorf("unsupported uint size: %d", size)
-	}
-}
-
-// convertToBool 转换为布尔值
-func (m *AdvancedInputModifier) convertToBool(value interface{}) (interface{}, error) {
-	switch v := value.(type) {
-	case bool:
-		return v, nil
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-		return reflect.ValueOf(v).Int() != 0, nil
-	case *big.Int:
-		return v.Sign() != 0, nil
-	case string:
-		lower := strings.ToLower(v)
-		if lower == "true" || lower == "1" {
-			return true, nil
-		} else if lower == "false" || lower == "0" {
-			return false, nil
-		}
-		return nil, fmt.Errorf("cannot parse string %s as bool", v)
-	default:
-		return nil, fmt.Errorf("cannot convert %T to bool", value)
-	}
-}
-
-// convertToString 转换为字符串
-func (m *AdvancedInputModifier) convertToString(value interface{}) (interface{}, error) {
-	switch v := value.(type) {
-	case string:
-		return v, nil
-	case []byte:
-		return string(v), nil
-	default:
-		return fmt.Sprintf("%v", v), nil
-	}
-}
-
-// convertToAddress 转换为地址
-func (m *AdvancedInputModifier) convertToAddress(value interface{}) (interface{}, error) {
-	switch v := value.(type) {
-	case common.Address:
-		return v, nil
-	case string:
-		if !common.IsHexAddress(v) {
-			return nil, fmt.Errorf("invalid address format: %s", v)
-		}
-		return common.HexToAddress(v), nil
-	case []byte:
-		if len(v) != 20 {
-			return nil, fmt.Errorf("invalid address length: %d", len(v))
-		}
-		return common.BytesToAddress(v), nil
-	default:
-		return nil, fmt.Errorf("cannot convert %T to address", value)
-	}
-}
-
-// convertToBytes 转换为动态字节数组
-func (m *AdvancedInputModifier) convertToBytes(value interface{}) (interface{}, error) {
-	switch v := value.(type) {
-	case []byte:
-		return v, nil
-	case string:
-		if strings.HasPrefix(v, "0x") {
-			return hexutil.Decode(v)
-		}
-		return []byte(v), nil
-	default:
-		return nil, fmt.Errorf("cannot convert %T to bytes", value)
-	}
-}
-
-// convertToFixedBytes 转换为固定长度字节数组
-func (m *AdvancedInputModifier) convertToFixedBytes(value interface{}, size int) (interface{}, error) {
-	var bytes []byte
-
-	switch v := value.(type) {
-	case []byte:
-		bytes = v
-	case string:
-		if strings.HasPrefix(v, "0x") {
-			var err error
-			bytes, err = hexutil.Decode(v)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			bytes = []byte(v)
-		}
-	default:
-		return nil, fmt.Errorf("cannot convert %T to fixed bytes", value)
-	}
-
-	if len(bytes) > size {
-		bytes = bytes[:size]
-	} else if len(bytes) < size {
-		// 右填充零
-		padded := make([]byte, size)
-		copy(padded, bytes)
-		bytes = padded
-	}
-
-	// 根据大小返回相应的数组类型
-	switch size {
-	case 32:
-		var result [32]byte
-		copy(result[:], bytes)
-		return result, nil
-	default:
-		// 对于其他大小，使用反射创建相应的数组类型
-		arrayType := reflect.ArrayOf(size, reflect.TypeOf(byte(0)))
-		arrayValue := reflect.New(arrayType).Elem()
-		reflect.Copy(arrayValue, reflect.ValueOf(bytes))
-		return arrayValue.Interface(), nil
-	}
-}
-
-// convertToSlice 转换为切片
-func (m *AdvancedInputModifier) convertToSlice(value interface{}, abiType abi.Type) (interface{}, error) {
-	// 这里需要根据实际需求实现切片转换
-	// 目前返回原值
-	return value, nil
-}
-
-// convertToArray 转换为数组
-func (m *AdvancedInputModifier) convertToArray(value interface{}, abiType abi.Type) (interface{}, error) {
-	// 这里需要根据实际需求实现数组转换
-	// 目前返回原值
-	return value, nil
-}
-
-func (m *AdvancedInputModifier) AddFunctionModification(mod *FunctionModification) error {
-	// 验证函数是否存在于ABI中
-	method, exists := m.contractABI.Methods[mod.FunctionName]
-	if !exists {
-		return fmt.Errorf("function %s not found in ABI", mod.FunctionName)
-	}
-
-	// 验证参数修改
-	for _, paramMod := range mod.ParameterMods {
-		if paramMod.ParameterIndex >= len(method.Inputs) {
-			return fmt.Errorf("parameter index %d out of range for function %s",
-				paramMod.ParameterIndex, mod.FunctionName)
-		}
-
-		// 如果提供了参数名称，验证是否匹配
-		if paramMod.ParameterName != "" {
-			expectedName := method.Inputs[paramMod.ParameterIndex].Name
-			if expectedName != paramMod.ParameterName {
-				return fmt.Errorf("parameter name mismatch: expected %s, got %s",
-					expectedName, paramMod.ParameterName)
+		for _, method := range m.contractABI.Methods {
+			if len(method.ID) >= 4 && bytesEqual(method.ID[:4], selector[:]) {
+				args, err := method.Inputs.Unpack(inputData[4:])
+				if err == nil {
+					fmt.Printf("Parsed original function: %s with %d args\n", method.Name, len(args))
+					for i, arg := range args {
+						fmt.Printf("  Arg[%d] (%s): %v\n", i, method.Inputs[i].Type.String(), arg)
+					}
+				}
+				break
 			}
 		}
 	}
-
-	// 存储修改规则
-	signature := mod.FunctionSignature
-	if signature == "" {
-		signature = method.Sig
-	}
-
-	m.functionMods[signature] = mod
-
-	// 同时按选择器存储
-	selector := method.ID
-	var selectorArray [4]byte
-	copy(selectorArray[:], selector[:4])
-	m.selectorMods[selectorArray] = mod
 
 	return nil
 }
 
-func (m *AdvancedInputModifier) ModifyInput(input []byte) ([]byte, error) {
-	fmt.Printf("\n=== INPUT MODIFICATION START ===\n")
-	fmt.Printf("Original input length: %d\n", len(input))
-	fmt.Printf("Original input data: %x\n", input)
-
-	if len(input) < 4 {
-		fmt.Printf("Input too short, returning original\n")
-		fmt.Printf("=== INPUT MODIFICATION END ===\n\n")
-		return input, nil // 不是函数调用
+// GenerateSmartModifications 生成智能修改集合（使用步长变异）
+func (m *InputModifier) GenerateSmartModifications() (*SmartModificationSet, error) {
+	if m.originalInput == nil {
+		return nil, fmt.Errorf("original input not set")
 	}
 
-	// 提取函数选择器
+	modSet := &SmartModificationSet{
+		Variations: make([]ModificationVariation, 0),
+		Strategy:   m.modStrategy,
+		Original: &OriginalState{
+			InputData: m.originalInput,
+			Storage:   m.originalStorage,
+		},
+	}
+
+	// 解析原始函数
+	if len(m.originalInput) >= 4 {
+		var selector [4]byte
+		copy(selector[:], m.originalInput[:4])
+
+		for _, method := range m.contractABI.Methods {
+			if len(method.ID) >= 4 && bytesEqual(method.ID[:4], selector[:]) {
+				modSet.Original.Function = &method
+				args, err := method.Inputs.Unpack(m.originalInput[4:])
+				if err == nil {
+					modSet.Original.Args = args
+				}
+				break
+			}
+		}
+	}
+
+	// 生成不同类型的步长变异
+	strategies := []string{"step_based", "nearby_values"}
+	if m.stepConfig.EnableBoundary {
+		strategies = append(strategies, "boundary_values")
+	}
+
+	for i, strategy := range strategies {
+		m.modStrategy.InputStrategy = strategy
+
+		// 为每种策略生成多个变体
+		variationsPerStrategy := 5 // 每种策略生成5个变体
+		for j := 0; j < variationsPerStrategy; j++ {
+			variation := ModificationVariation{
+				ID:              fmt.Sprintf("%s_step_%d_%d", strategy, i, j),
+				ExpectedImpact:  m.getExpectedImpact(strategy),
+				ModificationSet: make(map[string]interface{}),
+			}
+
+			// 生成基于步长的输入修改
+			inputMod, err := m.generateStepBasedInputModification(strategy, j)
+			if err == nil && inputMod != nil {
+				variation.InputMod = inputMod
+			}
+
+			// 生成基于步长的存储修改
+			storageMod := m.generateStepBasedStorageModification(strategy, j)
+			if storageMod != nil {
+				variation.StorageMod = storageMod
+			}
+
+			// 确保至少有一种修改类型
+			if variation.InputMod == nil && variation.StorageMod == nil {
+				// 强制生成一个基于步长的输入修改
+				fallbackInputMod := m.generateFallbackStepBasedInputModification(j)
+				if fallbackInputMod != nil {
+					variation.InputMod = fallbackInputMod
+				} else {
+					// 如果输入修改也失败，强制生成步长存储修改
+					fallbackStorageMod := m.generateFallbackStepBasedStorageModification(j)
+					if fallbackStorageMod != nil {
+						variation.StorageMod = fallbackStorageMod
+					}
+				}
+			}
+
+			// 只添加有效的变体
+			if variation.InputMod != nil || variation.StorageMod != nil {
+				modSet.Variations = append(modSet.Variations, variation)
+			}
+		}
+	}
+
+	fmt.Printf("Generated %d step-based modification variations\n", len(modSet.Variations))
+	return modSet, nil
+}
+
+// generateStepBasedInputModification 生成基于步长的输入修改
+func (m *InputModifier) generateStepBasedInputModification(strategy string, variant int) (*InputModification, error) {
+	if len(m.originalInput) < 4 {
+		return nil, fmt.Errorf("invalid input data")
+	}
+
 	var selector [4]byte
-	copy(selector[:], input[:4])
-	fmt.Printf("Function selector: %x\n", selector)
+	copy(selector[:], m.originalInput[:4])
 
-	// 查找修改规则
-	mod, exists := m.selectorMods[selector]
-	if !exists {
-		fmt.Printf("No modification rule found for selector %x\n", selector)
-		fmt.Printf("=== INPUT MODIFICATION END ===\n\n")
-		return input, nil // 没有修改规则
+	var method *abi.Method
+	for _, methodItem := range m.contractABI.Methods {
+		if len(methodItem.ID) >= 4 && bytesEqual(methodItem.ID[:4], selector[:]) {
+			method = &methodItem
+			break
+		}
 	}
 
-	fmt.Printf("Found modification rule for function: %s\n", mod.FunctionName)
-
-	// 获取对应的ABI方法
-	method, exists := m.contractABI.Methods[mod.FunctionName]
-	if !exists {
-		return nil, fmt.Errorf("method %s not found in ABI", mod.FunctionName)
+	if method == nil {
+		return nil, fmt.Errorf("method not found")
 	}
-
-	fmt.Printf("Method signature: %s\n", method.Sig)
-	fmt.Printf("Method inputs count: %d\n", len(method.Inputs))
 
 	// 解析原始参数
+	originalArgs, err := method.Inputs.Unpack(m.originalInput[4:])
+	if err != nil {
+		return nil, fmt.Errorf("failed to unpack args: %v", err)
+	}
+
+	// 根据策略修改参数（使用步长变异）
+	modifiedArgs := make([]interface{}, len(originalArgs))
+	copy(modifiedArgs, originalArgs)
+	paramChanges := make([]ParameterChange, 0)
+
+	// 确保至少修改一个参数
+	hasChanges := false
+	for i, arg := range originalArgs {
+		newArg, changed := m.modifyArgumentByStepStrategy(arg, method.Inputs[i].Type, strategy, variant)
+		if changed {
+			paramChanges = append(paramChanges, ParameterChange{
+				Index:       i,
+				Name:        method.Inputs[i].Name,
+				Type:        method.Inputs[i].Type.String(),
+				Original:    arg,
+				Modified:    newArg,
+				ChangeType:  m.determineChangeType(arg, newArg),
+				ChangeRatio: m.calculateChangeRatio(arg, newArg),
+			})
+			modifiedArgs[i] = newArg
+			hasChanges = true
+			fmt.Printf("🔧 Step-based parameter change: %s[%d] %v -> %v\n",
+				method.Inputs[i].Name, i, arg, newArg)
+		}
+	}
+
+	// 如果没有变化，强制修改第一个参数（使用步长）
+	if !hasChanges && len(originalArgs) > 0 {
+		firstArg := originalArgs[0]
+		modifiedArg := m.forceStepModifyArgument(firstArg, method.Inputs[0].Type, variant)
+
+		paramChanges = append(paramChanges, ParameterChange{
+			Index:       0,
+			Name:        method.Inputs[0].Name,
+			Type:        method.Inputs[0].Type.String(),
+			Original:    firstArg,
+			Modified:    modifiedArg,
+			ChangeType:  "forced_step_modify",
+			ChangeRatio: 0.1,
+		})
+		modifiedArgs[0] = modifiedArg
+		fmt.Printf("🔧 Forced step-based parameter change: %s[0] %v -> %v\n",
+			method.Inputs[0].Name, firstArg, modifiedArg)
+	}
+
+	if len(paramChanges) == 0 {
+		return nil, nil // 仍然没有修改
+	}
+
+	// 重新打包参数
+	packedArgs, err := method.Inputs.Pack(modifiedArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to pack modified args: %v", err)
+	}
+
+	modifiedInput := append(selector[:], packedArgs...)
+
+	inputMod := &InputModification{
+		OriginalInput:    m.originalInput,
+		ModifiedInput:    modifiedInput,
+		FunctionSelector: selector,
+		FunctionName:     method.Name,
+		ParameterChanges: paramChanges,
+		ModificationHash: ComputeModificationHash(m.originalInput, modifiedInput),
+	}
+
+	return inputMod, nil
+}
+
+// generateFallbackStepBasedInputModification 生成后备的基于步长的输入修改
+func (m *InputModifier) generateFallbackStepBasedInputModification(variant int) *InputModification {
+	if len(m.originalInput) < 4 {
+		return nil
+	}
+
+	var selector [4]byte
+	copy(selector[:], m.originalInput[:4])
+
+	var method *abi.Method
+	for _, methodItem := range m.contractABI.Methods {
+		if len(methodItem.ID) >= 4 && bytesEqual(methodItem.ID[:4], selector[:]) {
+			method = &methodItem
+			break
+		}
+	}
+
+	if method == nil {
+		return nil
+	}
+
+	// 创建一个基于步长的修改：对输入数据的特定字节位置应用步长变异
+	modifiedInput := make([]byte, len(m.originalInput))
+	copy(modifiedInput, m.originalInput)
+
+	// 选择步长
+	stepIndex := variant % len(m.stepConfig.BytesSteps)
+	step := m.stepConfig.BytesSteps[stepIndex]
+
+	// 对4字节之后的数据应用步长变异
+	if len(modifiedInput) > 4 {
+		paramData := modifiedInput[4:]
+		m.applyStepMutationToParameterBytes(paramData, step, variant)
+	}
+
+	// 创建一个虚拟的参数变化
+	paramChanges := []ParameterChange{
+		{
+			Index:       0,
+			Name:        "fallback_step_param",
+			Type:        "bytes",
+			Original:    m.originalInput,
+			Modified:    modifiedInput,
+			ChangeType:  "step_based_fallback",
+			ChangeRatio: 0.1,
+		},
+	}
+
+	return &InputModification{
+		OriginalInput:    m.originalInput,
+		ModifiedInput:    modifiedInput,
+		FunctionSelector: selector,
+		FunctionName:     method.Name,
+		ParameterChanges: paramChanges,
+		ModificationHash: ComputeModificationHash(m.originalInput, modifiedInput),
+	}
+}
+
+// generateFallbackStepBasedStorageModification 生成后备的基于步长的存储修改
+func (m *InputModifier) generateFallbackStepBasedStorageModification(variant int) *StorageModification {
+	changes := make([]StorageSlotChange, 0)
+
+	// 选择步长
+	stepIndex := variant % len(m.stepConfig.StorageSteps)
+	step := m.stepConfig.StorageSteps[stepIndex]
+
+	// 如果有原始存储，对其应用步长修改
+	if m.originalStorage != nil && len(m.originalStorage) > 0 {
+		count := 0
+		for slot, originalValue := range m.originalStorage {
+			// 应用步长变异
+			newValue := m.applyStepToStorageValue(originalValue, step)
+
+			change := StorageSlotChange{
+				Slot:        slot,
+				Original:    originalValue,
+				Modified:    newValue,
+				Delta:       big.NewInt(step),
+				ChangeType:  "step_increment",
+				ChangeRatio: m.calculateStorageChangeRatio(originalValue, newValue),
+				SlotType:    ExtractSlotType(slot),
+			}
+
+			changes = append(changes, change)
+			count++
+			if count >= m.stepConfig.MaxChanges { // 限制修改数量
+				break
+			}
+		}
+	} else {
+		// 如果没有原始存储，创建一些基于步长的虚拟存储修改
+		for i := 0; i < 2; i++ {
+			slot := common.BigToHash(big.NewInt(int64(i)))
+			originalValue := common.Hash{}
+			stepValue := step * int64(i+1)
+			newValue := common.BigToHash(big.NewInt(stepValue))
+
+			change := StorageSlotChange{
+				Slot:        slot,
+				Original:    originalValue,
+				Modified:    newValue,
+				Delta:       big.NewInt(stepValue),
+				ChangeType:  "step_set",
+				ChangeRatio: 1.0,
+				SlotType:    "simple",
+			}
+
+			changes = append(changes, change)
+		}
+	}
+
+	if len(changes) == 0 {
+		return nil
+	}
+
+	// 计算修改哈希
+	hashData := make([]byte, 0)
+	for _, change := range changes {
+		hashData = append(hashData, change.Slot.Bytes()...)
+		hashData = append(hashData, change.Modified.Bytes()...)
+	}
+
+	return &StorageModification{
+		Changes:          changes,
+		ModificationHash: crypto.Keccak256Hash(hashData),
+	}
+}
+
+// forceStepModifyArgument 强制使用步长修改参数
+func (m *InputModifier) forceStepModifyArgument(arg interface{}, argType abi.Type, variant int) interface{} {
+	// 根据变异索引选择步长
+	switch argType.T {
+	case abi.UintTy:
+		if val, ok := arg.(*big.Int); ok && val != nil {
+			stepIndex := variant % len(m.stepConfig.UintSteps)
+			step := m.stepConfig.UintSteps[stepIndex]
+			return new(big.Int).Add(val, new(big.Int).SetUint64(step))
+		}
+		if val, ok := arg.(uint8); ok {
+			stepIndex := variant % len(m.stepConfig.UintSteps)
+			step := m.stepConfig.UintSteps[stepIndex]
+			if step <= 255 {
+				newVal := uint64(val) + step
+				if newVal > 255 {
+					newVal = 255
+				}
+				return uint8(newVal)
+			}
+			return val + 1
+		}
+	case abi.IntTy:
+		if val, ok := arg.(*big.Int); ok && val != nil {
+			stepIndex := variant % len(m.stepConfig.IntSteps)
+			step := m.stepConfig.IntSteps[stepIndex]
+			return new(big.Int).Add(val, big.NewInt(step))
+		}
+		if val, ok := arg.(int8); ok {
+			stepIndex := variant % len(m.stepConfig.IntSteps)
+			step := m.stepConfig.IntSteps[stepIndex]
+			newVal := int64(val) + step
+			if newVal > 127 {
+				newVal = 127
+			} else if newVal < -128 {
+				newVal = -128
+			}
+			return int8(newVal)
+		}
+	case abi.BoolTy:
+		if val, ok := arg.(bool); ok {
+			return !val
+		}
+	case abi.StringTy:
+		if val, ok := arg.(string); ok {
+			return val + "_step_modified"
+		}
+	case abi.AddressTy:
+		if val, ok := arg.(common.Address); ok {
+			newAddr := val
+			stepIndex := variant % len(m.stepConfig.AddressSteps)
+			step := m.stepConfig.AddressSteps[stepIndex]
+			// 修改地址的最后字节
+			newAddr[19] = byte((int(newAddr[19]) + step) % 256)
+			return newAddr
+		}
+	}
+	return arg
+}
+
+// calculateChangeRatio 计算变化比例
+func (m *InputModifier) calculateChangeRatio(original, modified interface{}) float64 {
+	switch orig := original.(type) {
+	case *big.Int:
+		if mod, ok := modified.(*big.Int); ok {
+			if orig.Sign() == 0 {
+				return 1.0
+			}
+			delta := new(big.Int).Sub(mod, orig)
+			ratio := new(big.Float).Quo(new(big.Float).SetInt(delta), new(big.Float).SetInt(orig))
+			result, _ := ratio.Float64()
+			return result
+		}
+	case uint8:
+		if mod, ok := modified.(uint8); ok {
+			if orig == 0 {
+				return 1.0
+			}
+			return float64(int(mod)-int(orig)) / float64(orig)
+		}
+	case bool:
+		return 1.0 // 布尔值变化视为100%变化
+	case string:
+		if mod, ok := modified.(string); ok {
+			if len(orig) == 0 {
+				return 1.0
+			}
+			return float64(len(mod)-len(orig)) / float64(len(orig))
+		}
+	}
+	return 0.1 // 默认变化比例
+}
+
+// modifyArgumentByStepStrategy 根据步长策略修改参数
+func (m *InputModifier) modifyArgumentByStepStrategy(arg interface{}, argType abi.Type, strategy string, variant int) (interface{}, bool) {
+	switch strategy {
+	case "step_based":
+		return m.modifyWithSteps(arg, argType, variant)
+	case "nearby_values":
+		return m.modifyNearbyWithSteps(arg, argType, variant)
+	case "boundary_values":
+		if m.stepConfig.EnableBoundary {
+			return m.modifyWithBoundaryValues(arg, argType, variant)
+		}
+		return m.modifyWithSteps(arg, argType, variant)
+	default:
+		return m.modifyWithSteps(arg, argType, variant)
+	}
+}
+
+// modifyWithSteps 使用步长进行修改
+func (m *InputModifier) modifyWithSteps(arg interface{}, argType abi.Type, variant int) (interface{}, bool) {
+	switch argType.T {
+	case abi.UintTy:
+		if val, ok := arg.(*big.Int); ok && val != nil {
+			stepIndex := variant % len(m.stepConfig.UintSteps)
+			step := m.stepConfig.UintSteps[stepIndex]
+			newVal := new(big.Int).Add(val, new(big.Int).SetUint64(step))
+			return newVal, true
+		}
+		if val, ok := arg.(uint8); ok {
+			stepIndex := variant % len(m.stepConfig.UintSteps)
+			step := m.stepConfig.UintSteps[stepIndex]
+			if step <= 255 {
+				newVal := uint64(val) + step
+				if newVal > 255 {
+					newVal = 255
+				}
+				return uint8(newVal), true
+			}
+		}
+
+	case abi.IntTy:
+		if val, ok := arg.(*big.Int); ok && val != nil {
+			stepIndex := variant % len(m.stepConfig.IntSteps)
+			step := m.stepConfig.IntSteps[stepIndex]
+			newVal := new(big.Int).Add(val, big.NewInt(step))
+			return newVal, true
+		}
+		if val, ok := arg.(int8); ok {
+			stepIndex := variant % len(m.stepConfig.IntSteps)
+			step := m.stepConfig.IntSteps[stepIndex]
+			newVal := int64(val) + step
+			if newVal > 127 {
+				newVal = 127
+			} else if newVal < -128 {
+				newVal = -128
+			}
+			return int8(newVal), true
+		}
+
+	case abi.BoolTy:
+		if val, ok := arg.(bool); ok {
+			return !val, true
+		}
+
+	case abi.StringTy:
+		if val, ok := arg.(string); ok {
+			return val + "_step", true
+		}
+
+	case abi.AddressTy:
+		if val, ok := arg.(common.Address); ok {
+			stepIndex := variant % len(m.stepConfig.AddressSteps)
+			step := m.stepConfig.AddressSteps[stepIndex]
+			newAddr := val
+			// 修改地址的最后几个字节
+			for i := 0; i < 2 && i+step < 20; i++ {
+				byteIndex := 19 - i
+				newAddr[byteIndex] = byte((int(newAddr[byteIndex]) + step) % 256)
+			}
+			return newAddr, true
+		}
+	}
+
+	return arg, false
+}
+
+// modifyNearbyWithSteps 在原始值附近使用步长修改
+func (m *InputModifier) modifyNearbyWithSteps(arg interface{}, argType abi.Type, variant int) (interface{}, bool) {
+	if !m.stepConfig.EnableNearby {
+		return m.modifyWithSteps(arg, argType, variant)
+	}
+
+	switch argType.T {
+	case abi.UintTy:
+		if val, ok := arg.(*big.Int); ok && val != nil {
+			stepIndex := variant % len(m.stepConfig.UintSteps)
+			step := m.stepConfig.UintSteps[stepIndex]
+
+			// 在附近进行小幅度变异
+			if variant%2 == 0 {
+				return new(big.Int).Add(val, new(big.Int).SetUint64(step)), true
+			} else {
+				result := new(big.Int).Sub(val, new(big.Int).SetUint64(step))
+				if result.Sign() < 0 {
+					result = big.NewInt(0)
+				}
+				return result, true
+			}
+		}
+
+	case abi.IntTy:
+		if val, ok := arg.(*big.Int); ok && val != nil {
+			stepIndex := variant % len(m.stepConfig.IntSteps)
+			step := m.stepConfig.IntSteps[stepIndex]
+			// 交替加减
+			if variant%2 == 0 {
+				return new(big.Int).Add(val, big.NewInt(step)), true
+			} else {
+				return new(big.Int).Sub(val, big.NewInt(step)), true
+			}
+		}
+	}
+
+	// 对于其他类型，回退到标准步长修改
+	return m.modifyWithSteps(arg, argType, variant)
+}
+
+// modifyWithBoundaryValues 使用边界值修改
+func (m *InputModifier) modifyWithBoundaryValues(arg interface{}, argType abi.Type, variant int) (interface{}, bool) {
+	switch argType.T {
+	case abi.UintTy:
+		switch argType.Size {
+		case 8:
+			values := []uint8{0, 1, 127, 255}
+			if variant < len(values) {
+				return values[variant], true
+			}
+		case 256:
+			values := []*big.Int{
+				big.NewInt(0),
+				big.NewInt(1),
+				new(big.Int).Exp(big.NewInt(2), big.NewInt(128), nil),
+				new(big.Int).Sub(new(big.Int).Exp(big.NewInt(2), big.NewInt(256), nil), big.NewInt(1)),
+			}
+			if variant < len(values) {
+				return values[variant], true
+			}
+		}
+
+	case abi.IntTy:
+		switch argType.Size {
+		case 8:
+			values := []int8{-128, -1, 0, 1, 127}
+			if variant < len(values) {
+				return values[variant], true
+			}
+		case 256:
+			values := []*big.Int{
+				new(big.Int).Neg(new(big.Int).Exp(big.NewInt(2), big.NewInt(255), nil)),
+				big.NewInt(-1),
+				big.NewInt(0),
+				big.NewInt(1),
+				new(big.Int).Sub(new(big.Int).Exp(big.NewInt(2), big.NewInt(255), nil), big.NewInt(1)),
+			}
+			if variant < len(values) {
+				return values[variant], true
+			}
+		}
+
+	case abi.BoolTy:
+		return variant%2 == 0, true
+
+	case abi.StringTy:
+		values := []string{"", "a", strings.Repeat("a", 1000)}
+		if variant < len(values) {
+			return values[variant], true
+		}
+	}
+
+	return arg, false
+}
+
+// generateStepBasedStorageModification 生成基于步长的存储修改
+func (m *InputModifier) generateStepBasedStorageModification(strategy string, variant int) *StorageModification {
+	changes := make([]StorageSlotChange, 0)
+
+	if m.originalStorage != nil && len(m.originalStorage) > 0 {
+		// 选择步长
+		stepIndex := variant % len(m.stepConfig.StorageSteps)
+		step := m.stepConfig.StorageSteps[stepIndex]
+
+		fmt.Printf("💾 Applying step-based storage modification: step=%d, strategy=%s\n", step, strategy)
+
+		// 只修改原始存储中已有的槽
+		count := 0
+		for slot, originalValue := range m.originalStorage {
+			if count >= m.stepConfig.MaxChanges {
+				break
+			}
+
+			newValue := m.modifyStorageByStepStrategy(originalValue, slot, strategy, step, variant)
+			if newValue != originalValue {
+				originalBig := originalValue.Big()
+				modifiedBig := newValue.Big()
+
+				change := StorageSlotChange{
+					Slot:        slot,
+					Original:    originalValue,
+					Modified:    newValue,
+					Delta:       new(big.Int).Sub(modifiedBig, originalBig),
+					ChangeType:  DetermineChangeType(originalBig, modifiedBig),
+					ChangeRatio: CalculateChangeRatio(originalBig, modifiedBig),
+					SlotType:    ExtractSlotType(slot),
+				}
+
+				changes = append(changes, change)
+				count++
+				fmt.Printf("   Step-modified slot %s: %s -> %s (step: %d)\n",
+					slot.Hex()[:10]+"...", originalValue.Hex()[:10]+"...", newValue.Hex()[:10]+"...", step)
+			}
+		}
+	}
+
+	if len(changes) == 0 {
+		return nil
+	}
+
+	storageMod := &StorageModification{
+		Changes: changes,
+	}
+
+	// 计算修改哈希
+	hashData := make([]byte, 0)
+	for _, change := range changes {
+		hashData = append(hashData, change.Slot.Bytes()...)
+		hashData = append(hashData, change.Modified.Bytes()...)
+	}
+	storageMod.ModificationHash = crypto.Keccak256Hash(hashData)
+
+	return storageMod
+}
+
+// modifyStorageByStepStrategy 根据步长策略修改存储值
+func (m *InputModifier) modifyStorageByStepStrategy(original common.Hash, slot common.Hash, strategy string, step int64, variant int) common.Hash {
+	originalBig := original.Big()
+
+	switch strategy {
+	case "step_based":
+		// 直接应用步长
+		return m.applyStepToStorageValue(original, step)
+
+	case "nearby_values":
+		if m.stepConfig.EnableNearby {
+			// 在原值附近使用小步长
+			smallStep := step / 10
+			if smallStep == 0 {
+				smallStep = 1
+			}
+			if variant%2 == 0 {
+				return common.BigToHash(new(big.Int).Add(originalBig, big.NewInt(smallStep)))
+			} else {
+				result := new(big.Int).Sub(originalBig, big.NewInt(smallStep))
+				if result.Sign() < 0 {
+					result = big.NewInt(0)
+				}
+				return common.BigToHash(result)
+			}
+		}
+		return m.applyStepToStorageValue(original, step)
+
+	case "boundary_values":
+		if m.stepConfig.EnableBoundary {
+			values := []*big.Int{
+				big.NewInt(0),
+				big.NewInt(1),
+				big.NewInt(0xffffffff),
+				new(big.Int).Sub(new(big.Int).Exp(big.NewInt(2), big.NewInt(256), nil), big.NewInt(1)),
+			}
+			if variant < len(values) {
+				return common.BigToHash(values[variant])
+			}
+		}
+		return m.applyStepToStorageValue(original, step)
+
+	default:
+		return m.applyStepToStorageValue(original, step)
+	}
+}
+
+// applyStepToStorageValue 对存储值应用步长
+func (m *InputModifier) applyStepToStorageValue(original common.Hash, step int64) common.Hash {
+	originalBig := original.Big()
+
+	if step > 0 {
+		// 正步长：加法
+		return common.BigToHash(new(big.Int).Add(originalBig, big.NewInt(step)))
+	} else if step < 0 {
+		// 负步长：减法（确保不为负）
+		result := new(big.Int).Sub(originalBig, big.NewInt(-step))
+		if result.Sign() < 0 {
+			result = big.NewInt(0)
+		}
+		return common.BigToHash(result)
+	}
+
+	return original // step为0时不修改
+}
+
+// calculateStorageChangeRatio 计算存储变化比例
+func (m *InputModifier) calculateStorageChangeRatio(original, modified common.Hash) float64 {
+	originalBig := original.Big()
+	modifiedBig := modified.Big()
+
+	if originalBig.Sign() == 0 {
+		if modifiedBig.Sign() == 0 {
+			return 0.0
+		}
+		return 1.0
+	}
+
+	delta := new(big.Int).Sub(modifiedBig, originalBig)
+	ratio := new(big.Float).Quo(new(big.Float).SetInt(delta), new(big.Float).SetInt(originalBig))
+	result, _ := ratio.Float64()
+	return result
+}
+
+// applyStepMutationToParameterBytes 对参数字节应用步长变异
+func (m *InputModifier) applyStepMutationToParameterBytes(data []byte, step int, variant int) {
+	if len(data) == 0 {
+		return
+	}
+
+	// 根据数据长度和变异类型选择修改策略
+	switch variant % 3 {
+	case 0: // 修改整个32字节块（如果足够长）
+		if len(data) >= 32 {
+			// 将前32字节作为big.Int处理
+			value := new(big.Int).SetBytes(data[:32])
+			newValue := new(big.Int).Add(value, big.NewInt(int64(step)))
+
+			// 将结果写回，保持32字节长度
+			newBytes := newValue.Bytes()
+			// 清零前32字节
+			for i := 0; i < 32; i++ {
+				data[i] = 0
+			}
+			// 复制新值，右对齐
+			copy(data[32-len(newBytes):32], newBytes)
+		}
+	case 1: // 修改特定位置的字节
+		byteIndex := variant % len(data)
+		newByte := (int(data[byteIndex]) + step) % 256
+		if newByte < 0 {
+			newByte = 256 + newByte
+		}
+		data[byteIndex] = byte(newByte)
+	case 2: // 修改多个字节位置
+		maxChanges := 3
+		if len(data) < maxChanges {
+			maxChanges = len(data)
+		}
+
+		for i := 0; i < maxChanges; i++ {
+			byteIndex := (variant + i) % len(data)
+			newByte := (int(data[byteIndex]) + step) % 256
+			if newByte < 0 {
+				newByte = 256 + newByte
+			}
+			data[byteIndex] = byte(newByte)
+		}
+	}
+}
+
+// 辅助函数
+func (m *InputModifier) determineChangeType(original, modified interface{}) string {
+	origValue := reflect.ValueOf(original)
+	modValue := reflect.ValueOf(modified)
+
+	if origValue.Type() != modValue.Type() {
+		return "type_change"
+	}
+
+	switch origValue.Kind() {
+	case reflect.String:
+		if origValue.String() == modValue.String() {
+			return "unchanged"
+		}
+		return "step_replace"
+	case reflect.Bool:
+		return "toggle"
+	default:
+		return "step_modify"
+	}
+}
+
+func (m *InputModifier) getExpectedImpact(strategy string) string {
+	switch strategy {
+	case "step_based":
+		return "step_based_behavior_change"
+	case "nearby_values":
+		return "nearby_value_exploitation"
+	case "boundary_values":
+		return "boundary_value_exploitation"
+	default:
+		return "unknown_step_based"
+	}
+}
+
+// bytesEqual 比较字节数组是否相等
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// 保持原有的兼容性方法
+func (m *InputModifier) AddModification(functionName string, paramIndex int, newValue interface{}) error {
+	method, exists := m.contractABI.Methods[functionName]
+	if !exists {
+		return fmt.Errorf("function %s not found in ABI", functionName)
+	}
+
+	var selector [4]byte
+	if len(method.ID) >= 4 {
+		copy(selector[:], method.ID[:4])
+	}
+
+	mod := &FunctionModification{
+		FunctionName:      functionName,
+		FunctionSignature: method.Sig,
+		ParameterMods: []ParameterModification{
+			{
+				ParameterIndex: paramIndex,
+				NewValue:       newValue,
+				ModType:        "direct",
+			},
+		},
+	}
+
+	m.modifications[selector] = mod
+	return nil
+}
+
+func (m *InputModifier) ModifyInput(input []byte) ([]byte, error) {
+	if len(input) < 4 {
+		return input, nil
+	}
+
+	var selector [4]byte
+	copy(selector[:], input[:4])
+
+	mod, exists := m.modifications[selector]
+	if !exists {
+		return input, nil
+	}
+
+	method, exists := m.contractABI.Methods[mod.FunctionName]
+	if !exists {
+		return nil, fmt.Errorf("method %s not found", mod.FunctionName)
+	}
+
 	args, err := method.Inputs.Unpack(input[4:])
 	if err != nil {
 		return nil, fmt.Errorf("failed to unpack input: %v", err)
 	}
 
-	fmt.Printf("Original args for %s: %+v\n", mod.FunctionName, args)
-	for i, arg := range args {
-		fmt.Printf("  [%d] %s = %v (type: %T)\n", i, method.Inputs[i].Name, arg, arg)
-	}
-
-	// 应用参数修改，包含类型转换
-	modifiedArgs := make([]interface{}, len(args))
-	copy(modifiedArgs, args)
-
-	fmt.Printf("Applying %d parameter modifications:\n", len(mod.ParameterMods))
 	for _, paramMod := range mod.ParameterMods {
-		if paramMod.ParameterIndex < len(modifiedArgs) {
-			oldValue := modifiedArgs[paramMod.ParameterIndex]
-
-			// 获取目标参数的ABI类型
-			abiType := method.Inputs[paramMod.ParameterIndex].Type
-
-			// 转换新值到正确的类型
-			convertedValue, err := m.convertToABIType(paramMod.NewValue, abiType)
-			if err != nil {
-				return nil, fmt.Errorf("failed to convert parameter %d: %v", paramMod.ParameterIndex, err)
-			}
-
-			modifiedArgs[paramMod.ParameterIndex] = convertedValue
-
-			fmt.Printf("Modified parameter %d (%s): %v (type: %T) -> %v (type: %T)\n",
-				paramMod.ParameterIndex,
-				method.Inputs[paramMod.ParameterIndex].Name,
-				oldValue, oldValue,
-				convertedValue, convertedValue)
+		if paramMod.ParameterIndex < len(args) {
+			args[paramMod.ParameterIndex] = paramMod.NewValue
 		}
 	}
 
-	// 确定目标函数方法
-	var targetMethod abi.Method
-	if mod.NewFunctionName != "" {
-		// 使用新函数名
-		var exists bool
-		targetMethod, exists = m.contractABI.Methods[mod.NewFunctionName]
-		if !exists {
-			return nil, fmt.Errorf("target method %s not found in ABI", mod.NewFunctionName)
-		}
-		fmt.Printf("Changed function: %s -> %s\n", mod.FunctionName, mod.NewFunctionName)
-		fmt.Printf("New function selector: %x\n", targetMethod.ID[:4])
-	} else {
-		// 使用原函数名
-		targetMethod = method
-		fmt.Printf("Keeping original function: %s\n", mod.FunctionName)
-	}
-
-	// 重新打包参数
-	fmt.Printf("Repacking args: %+v\n", modifiedArgs)
-	packedArgs, err := targetMethod.Inputs.Pack(modifiedArgs...)
+	packedArgs, err := method.Inputs.Pack(args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack modified args: %v", err)
 	}
 
-	// 组合新的input data
 	result := make([]byte, 4+len(packedArgs))
-	copy(result[:4], targetMethod.ID[:4])
+	copy(result[:4], selector[:])
 	copy(result[4:], packedArgs)
-
-	fmt.Printf("Modified input length: %d\n", len(result))
-	fmt.Printf("Modified input data: %x\n", result)
-	fmt.Printf("=== INPUT MODIFICATION END ===\n\n")
 
 	return result, nil
 }
 
-// InputModifier 保留原有的简单功能以保持向后兼容
-// InputModifier modifies transaction input data
-type InputModifier struct {
-	targetSelector      [4]byte
-	replacementSelector [4]byte
-}
-
-func NewInputModifier(targetFunc, replacementFunc string) *InputModifier {
-	return &InputModifier{
-		targetSelector:      getFunctionSelector(targetFunc),
-		replacementSelector: getFunctionSelector(replacementFunc),
+func (m *InputModifier) GenerateRandomModifications() error {
+	modifications := map[string]interface{}{
+		"setUint1":   uint8(42),
+		"setUint2":   big.NewInt(12345),
+		"setUint3":   big.NewInt(98765),
+		"setInt1":    int8(-10),
+		"setInt2":    big.NewInt(-54321),
+		"setInt3":    big.NewInt(-11111),
+		"setBool1":   true,
+		"setBool2":   false,
+		"setString1": "modified_string",
+		"setString2": "another_modified_string",
 	}
+
+	for funcName, newValue := range modifications {
+		err := m.AddModification(funcName, 0, newValue)
+		if err != nil {
+			fmt.Printf("Warning: failed to add modification for %s: %v\n", funcName, err)
+		}
+	}
+
+	return nil
 }
 
 func getFunctionSelector(signature string) [4]byte {
@@ -525,25 +1061,4 @@ func getFunctionSelector(signature string) [4]byte {
 	var selector [4]byte
 	copy(selector[:], hash[:4])
 	return selector
-}
-
-func (m *InputModifier) ModifyInput(input []byte) []byte {
-	if len(input) < 4 {
-		return input
-	}
-
-	var currentSelector [4]byte
-	copy(currentSelector[:], input[:4])
-
-	if currentSelector == m.targetSelector {
-		modified := make([]byte, len(input))
-		copy(modified, input)
-		copy(modified[:4], m.replacementSelector[:])
-
-		fmt.Printf("Modified function selector: %x -> %x\n",
-			m.targetSelector, m.replacementSelector)
-		return modified
-	}
-
-	return input
 }

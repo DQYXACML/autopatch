@@ -12,13 +12,16 @@ import (
 
 	"github.com/DQYXACML/autopatch/config"
 	"github.com/DQYXACML/autopatch/database/common"
+	_ "github.com/DQYXACML/autopatch/database/utils/serializers"
 )
 
 type DB struct {
 	gorm *gorm.DB
 
 	Blocks           common.BlocksDB
+	Addresses        common.AddressesDB
 	Protected        worker.ProtectedAddDB
+	AttackTx         worker.AttackTxDB
 	ProtectedStorage worker.ProtectedStorageDB
 	ProtectedTx      worker.ProtectedTxDB
 }
@@ -48,6 +51,8 @@ func NewDB(ctx context.Context, dbConfig config.DBConfig) (*DB, error) {
 	db := &DB{
 		gorm:             gorm,
 		Blocks:           common.NewBlocksDB(gorm),
+		Addresses:        common.NewAddressesDB(gorm),
+		AttackTx:         worker.NewAttackTxDB(gorm),
 		Protected:        worker.NewProtectedAddDB(gorm),
 		ProtectedStorage: worker.NewProtectedStorageDB(gorm),
 		ProtectedTx:      worker.NewProtectedTxDB(gorm),
@@ -60,6 +65,8 @@ func (db *DB) Transaction(fn func(db *DB) error) error {
 		txDB := &DB{
 			gorm:             tx,
 			Blocks:           common.NewBlocksDB(tx),
+			Addresses:        common.NewAddressesDB(tx),
+			AttackTx:         worker.NewAttackTxDB(tx),
 			Protected:        worker.NewProtectedAddDB(tx),
 			ProtectedStorage: worker.NewProtectedStorageDB(tx),
 			ProtectedTx:      worker.NewProtectedTxDB(tx),

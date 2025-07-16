@@ -18,6 +18,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/triedb"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 )
@@ -81,10 +82,82 @@ func (j *jumpdestTracer) opcodeHook(pc uint64, op byte, _gas, _cost uint64,
 
 type miniCtx struct{ db ethdb.Database }
 
-func (m miniCtx) Config() *params.ChainConfig { return params.HoleskyChainConfig }
-func (m miniCtx) Engine() consensus.Engine    { return nil }
+func (m miniCtx) Config() *params.ChainConfig {
+	// 创建支持所有硬分叉的配置，而不是使用默认的 HoleskyChainConfig
+	return createFullySupportedChainConfig(17000) // 17000 是 Holesky 的链ID
+}
+
+func (m miniCtx) Engine() consensus.Engine { return nil }
+
 func (m miniCtx) GetHeader(_ context.Context, h common.Hash, n uint64) *types.Header {
 	return rawdb.ReadHeader(m.db, h, n)
+}
+
+// createFullySupportedChainConfig 创建完全支持所有硬分叉的链配置
+func createFullySupportedChainConfig(chainID uint64) *params.ChainConfig {
+	var baseConfig *params.ChainConfig
+	switch chainID {
+	case 1:
+		baseConfig = params.MainnetChainConfig
+	case 17000:
+		baseConfig = params.HoleskyChainConfig
+	case 11155111:
+		baseConfig = params.SepoliaChainConfig
+	default:
+		baseConfig = params.HoleskyChainConfig
+	}
+
+	// 创建新的配置，确保所有硬分叉都已激活
+	config := &params.ChainConfig{
+		ChainID:                 big.NewInt(int64(chainID)),
+		HomesteadBlock:          big.NewInt(0),
+		DAOForkBlock:            nil,
+		DAOForkSupport:          false,
+		EIP150Block:             big.NewInt(0),
+		EIP155Block:             big.NewInt(0),
+		EIP158Block:             big.NewInt(0),
+		ByzantiumBlock:          big.NewInt(0),
+		ConstantinopleBlock:     big.NewInt(0),
+		PetersburgBlock:         big.NewInt(0),
+		IstanbulBlock:           big.NewInt(0),
+		MuirGlacierBlock:        big.NewInt(0),
+		BerlinBlock:             big.NewInt(0),
+		LondonBlock:             big.NewInt(0),
+		ArrowGlacierBlock:       big.NewInt(0),
+		GrayGlacierBlock:        big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
+		TerminalTotalDifficulty: baseConfig.TerminalTotalDifficulty,
+		Ethash:                  baseConfig.Ethash,
+		Clique:                  baseConfig.Clique,
+	}
+
+	// 设置基于时间的硬分叉
+	switch chainID {
+	case 1: // 主网
+		shanghaiTime := uint64(1681338455) // 主网Shanghai时间
+		cancunTime := uint64(1710338135)   // 主网Cancun时间
+		config.ShanghaiTime = &shanghaiTime
+		config.CancunTime = &cancunTime
+	case 17000: // Holesky测试网
+		// Holesky在创世时就支持所有硬分叉
+		genesisTime := uint64(0)
+		config.ShanghaiTime = &genesisTime
+		config.CancunTime = &genesisTime
+	case 11155111: // Sepolia测试网
+		genesisTime := uint64(0)
+		config.ShanghaiTime = &genesisTime
+		config.CancunTime = &genesisTime
+	default:
+		// 默认启用所有硬分叉
+		genesisTime := uint64(0)
+		config.ShanghaiTime = &genesisTime
+		config.CancunTime = &genesisTime
+	}
+
+	fmt.Printf("Created chain config for chainID %d with Shanghai time: %v (PUSH0 enabled)\n",
+		chainID, config.ShanghaiTime)
+
+	return config
 }
 
 func die(err error, msg string) {
@@ -161,6 +234,9 @@ func RelayTx(tx1 common.Hash) {
 	gp := new(core.GasPool)
 	gp.AddGas(header.GasLimit)
 
+	// 修复：使用支持所有硬分叉的链配置
+	chainConfig := createFullySupportedChainConfig(chainID.Uint64())
+
 	blockCtx := vm.BlockContext{
 		CanTransfer: core.CanTransfer,
 		Transfer:    core.Transfer,
@@ -179,7 +255,7 @@ func RelayTx(tx1 common.Hash) {
 		}
 		from, err := types.Sender(signer, orig)
 		die(err, "sender pre-tx")
-		evm := vm.NewEVM(blockCtx, stateDB, params.HoleskyChainConfig, vm.Config{})
+		evm := vm.NewEVM(blockCtx, stateDB, chainConfig, vm.Config{})
 		evm.SetTxContext(vm.TxContext{Origin: from, GasPrice: orig.GasPrice()})
 		var used uint64
 		_, err = core.ApplyTransaction(evm, gp, stateDB, header, orig, &used)
@@ -195,7 +271,7 @@ func RelayTx(tx1 common.Hash) {
 
 	from, err := types.Sender(signer, tx)
 	die(err, "sender new-tx")
-	evm := vm.NewEVM(blockCtx, stateDB, params.HoleskyChainConfig, vmConf)
+	evm := vm.NewEVM(blockCtx, stateDB, chainConfig, vmConf)
 	evm.SetTxContext(vm.TxContext{Origin: from, GasPrice: tx.GasPrice()})
 
 	newTx := types.NewTransaction(tx.Nonce(), *tx.To(), tx.Value(),

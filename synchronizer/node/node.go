@@ -25,6 +25,16 @@ type myClient struct {
 	rpc RPC
 }
 
+func (m *myClient) SendRawTransaction(rawTx string) error {
+	ctxwt, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+	if err := m.rpc.CallContext(ctxwt, nil, "eth_sendRawTransaction", rawTx); err != nil {
+		return err
+	}
+	log.Info("send tx to ethereum success")
+	return nil
+}
+
 func (m *myClient) TraceCallPath(hash common.Hash) (*callFrame, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
 	defer cancel()
@@ -378,6 +388,7 @@ type EthClient interface {
 	FilterLogs(query ethereum.FilterQuery) (Logs, error)
 
 	TxCountByAddress(common.Address) (hexutil.Uint64, error)
+	SendRawTransaction(rawTx string) error
 
 	DebugTraceAll(common.Address) ([]byte, error)
 	DebugTraceTransaction(hash common.Hash) ([]byte, error)
