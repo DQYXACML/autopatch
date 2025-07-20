@@ -35,11 +35,11 @@ func (m *myClient) SendRawTransaction(rawTx string) error {
 	return nil
 }
 
-func (m *myClient) TraceCallPath(hash common.Hash) (*callFrame, error) {
+func (m *myClient) TraceCallPath(hash common.Hash) (*NodecallFrame, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
 	defer cancel()
 
-	var root callFrame
+	var root NodecallFrame
 	cfg := map[string]any{"tracer": "callTracer"}
 	if err := m.rpc.CallContext(ctx, &root, "debug_traceTransaction", hash, cfg); err != nil {
 		return nil, err
@@ -362,15 +362,15 @@ type Logs struct {
 	ToBlockHeader *types.Header
 }
 
-type callFrame struct {
-	Type    string      `json:"type"`
-	From    string      `json:"from"`
-	To      string      `json:"to"`
-	Input   string      `json:"input"`
-	Calls   []callFrame `json:"calls,omitempty"`
-	Gas     string      `json:"gas"`
-	GasUsed string      `json:"gas_used"`
-	Value   string      `json:"value"`
+type NodecallFrame struct {
+	Type    string          `json:"type"`
+	From    string          `json:"from"`
+	To      string          `json:"to"`
+	Input   string          `json:"input"`
+	Calls   []NodecallFrame `json:"calls,omitempty"`
+	Gas     string          `json:"gas"`
+	GasUsed string          `json:"gas_used"`
+	Value   string          `json:"value"`
 }
 
 type EthClient interface {
@@ -393,7 +393,7 @@ type EthClient interface {
 	DebugTraceAll(common.Address) ([]byte, error)
 	DebugTraceTransaction(hash common.Hash) ([]byte, error)
 
-	TraceCallPath(hash common.Hash) (*callFrame, error)
+	TraceCallPath(hash common.Hash) (*NodecallFrame, error)
 	TraceOpcodes(hash common.Hash) ([]map[string]interface{}, error)
 
 	GetStorageAt(common.Hash) (storage.Storage, error)

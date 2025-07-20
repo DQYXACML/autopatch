@@ -1,7 +1,6 @@
 package tracing
 
 import (
-	"github.com/DQYXACML/autopatch/txmgr/ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	ccrypto "github.com/ethereum/go-ethereum/crypto"
@@ -21,61 +20,6 @@ type ExecutionPath struct {
 	Jumps []ExecutionJump `json:"jumps"`
 }
 
-// ComputePathHash computes a simple hash for path comparison
-func (p *ExecutionPath) ComputePathHash() [32]byte {
-	data := make([]byte, 0)
-	for _, jump := range p.Jumps {
-		data = append(data, jump.ContractAddress.Bytes()...)
-		jumpFromBytes := make([]byte, 8)
-		jumpDestBytes := make([]byte, 8)
-		for i := 0; i < 8; i++ {
-			jumpFromBytes[i] = byte(jump.JumpFrom >> (8 * (7 - i)))
-			jumpDestBytes[i] = byte(jump.JumpDest >> (8 * (7 - i)))
-		}
-		data = append(data, jumpFromBytes...)
-		data = append(data, jumpDestBytes...)
-	}
-	return [32]byte(ccrypto.Keccak256Hash(data))
-}
-
-// IsSimilar compares two execution paths and returns similarity percentage
-func (p *ExecutionPath) IsSimilar(other *ExecutionPath, threshold float64) bool {
-	if other == nil {
-		return false
-	}
-
-	if len(p.Jumps) == 0 && len(other.Jumps) == 0 {
-		return true
-	}
-
-	if len(p.Jumps) == 0 || len(other.Jumps) == 0 {
-		return false
-	}
-
-	// 计算相同跳转的数量
-	matches := 0
-	minLen := len(p.Jumps)
-	if len(other.Jumps) < minLen {
-		minLen = len(other.Jumps)
-	}
-
-	for i := 0; i < minLen; i++ {
-		if p.Jumps[i].ContractAddress == other.Jumps[i].ContractAddress &&
-			p.Jumps[i].JumpFrom == other.Jumps[i].JumpFrom &&
-			p.Jumps[i].JumpDest == other.Jumps[i].JumpDest {
-			matches++
-		}
-	}
-
-	maxLen := len(p.Jumps)
-	if len(other.Jumps) > maxLen {
-		maxLen = len(other.Jumps)
-	}
-
-	similarity := float64(matches) / float64(maxLen)
-	return similarity >= threshold
-}
-
 // Account represents an Ethereum account state
 type Account struct {
 	Balance *hexutil.Big                `json:"balance,omitempty"`
@@ -86,6 +30,39 @@ type Account struct {
 
 // PrestateResult represents the result from prestateTracer
 type PrestateResult map[common.Address]*Account
+
+// CallFrame represents a call frame from debug_traceTransaction with callTracer
+type CallFrame struct {
+	Type    string      `json:"type"`
+	From    string      `json:"from"`
+	To      string      `json:"to"`
+	Input   string      `json:"input"`
+	Calls   []CallFrame `json:"calls,omitempty"`
+	Gas     string      `json:"gas"`
+	GasUsed string      `json:"gasUsed"`
+	Value   string      `json:"value"`
+	Output  string      `json:"output,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
+// ExtractedCallData represents extracted call data for protected contracts
+type ExtractedCallData struct {
+	ContractAddress common.Address `json:"contractAddress"`
+	From            common.Address `json:"from"`
+	InputData       []byte         `json:"inputData"`
+	CallType        string         `json:"callType"`
+	Value           *big.Int       `json:"value"`
+	Gas             uint64         `json:"gas"`
+	Depth           int            `json:"depth"`
+}
+
+// CallTrace represents the complete call trace with extracted data
+type CallTrace struct {
+	OriginalTxHash     common.Hash         `json:"originalTxHash"`
+	RootCall           *CallFrame          `json:"rootCall"`
+	ExtractedCalls     []ExtractedCallData `json:"extractedCalls"`
+	ProtectedContracts []common.Address    `json:"protectedContracts"`
+}
 
 // StorageChange represents a single storage slot change
 type StorageChange struct {
@@ -122,6 +99,9 @@ type ModificationCandidate struct {
 	Priority       int                         `json:"priority"`
 	ExpectedImpact string                      `json:"expectedImpact"`
 	GeneratedAt    time.Time                   `json:"generatedAt"`
+
+	// 新增字段：记录修改来源的调用数据
+	SourceCallData *ExtractedCallData `json:"sourceCallData,omitempty"`
 }
 
 // SimulationResult 模拟执行结果
@@ -279,6 +259,9 @@ type SimplifiedReplayResult struct {
 	HighestSimilarity float64                 `json:"highestSimilarity"`
 	ProcessingTime    time.Duration           `json:"processingTime"`
 	Statistics        *SimpleReplayStatistics `json:"statistics"`
+
+	// 新增字段：调用跟踪信息
+	CallTrace *CallTrace `json:"callTrace,omitempty"`
 }
 
 // SimpleReplayStatistics 简化的重放统计信息
@@ -370,6 +353,9 @@ type MutationData struct {
 	Success        bool                        `json:"success"`
 	ErrorMessage   string                      `json:"errorMessage"`
 	ExecutionTime  time.Duration               `json:"executionTime"`
+
+	// 新增字段：记录变异来源
+	SourceCallData *ExtractedCallData `json:"sourceCallData,omitempty"`
 }
 
 // MutationCollection 变异数据集合，用于发送给链上处理
@@ -387,6 +373,10 @@ type MutationCollection struct {
 	HighestSimilarity   float64                     `json:"highestSimilarity"`
 	ProcessingTime      time.Duration               `json:"processingTime"`
 	CreatedAt           time.Time                   `json:"createdAt"`
+
+	// 新增字段：保存调用跟踪和多合约存储
+	CallTrace           *CallTrace                                     `json:"callTrace,omitempty"`
+	AllContractsStorage map[common.Address]map[common.Hash]common.Hash `json:"allContractsStorage,omitempty"`
 }
 
 // ToSolidityFormat 转换为适合发送给Solidity的格式
@@ -730,45 +720,6 @@ func convertToBigInt(value interface{}) (*big.Int, bool) {
 
 // ========== 并发修改相关辅助函数 ==========
 
-// CreateTransactionPackage 创建交易包
-func CreateTransactionPackage(candidate *ModificationCandidate, similarity float64,
-	contractAddr common.Address, originalTxHash common.Hash) *ethereum.TransactionPackage {
-
-	pkg := &ethereum.TransactionPackage{
-		ID:              candidate.ID,
-		ContractAddress: contractAddr,
-		InputUpdates:    make([]ethereum.InputUpdate, 0),
-		StorageUpdates:  make([]ethereum.StorageUpdate, 0),
-		Similarity:      similarity,
-		OriginalTxHash:  originalTxHash,
-		CreatedAt:       time.Now(),
-		Priority:        candidate.Priority,
-	}
-
-	// 处理输入更新
-	if candidate.InputData != nil && len(candidate.InputData) > 0 {
-		inputUpdate := ethereum.InputUpdate{
-			ModifiedInput: candidate.InputData,
-		}
-		if len(candidate.InputData) >= 4 {
-			copy(inputUpdate.FunctionSelector[:], candidate.InputData[:4])
-		}
-		pkg.InputUpdates = append(pkg.InputUpdates, inputUpdate)
-	}
-
-	// 处理存储更新
-	for slot, value := range candidate.StorageChanges {
-		storageUpdate := ethereum.StorageUpdate{
-			Slot:          slot,
-			ModifiedValue: value,
-			SlotType:      ExtractSlotType(slot),
-		}
-		pkg.StorageUpdates = append(pkg.StorageUpdates, storageUpdate)
-	}
-
-	return pkg
-}
-
 // DefaultConcurrentModificationConfig 默认并发修改配置
 func DefaultConcurrentModificationConfig() *ConcurrentModificationConfig {
 	return &ConcurrentModificationConfig{
@@ -782,106 +733,4 @@ func DefaultConcurrentModificationConfig() *ConcurrentModificationConfig {
 	}
 }
 
-// CreateInputProtectionRuleFromCandidate 从修改候选创建输入保护规则
-func CreateInputProtectionRuleFromCandidate(candidate *ModificationCandidate, originalInput []byte) InputProtectionRule {
-	rule := InputProtectionRule{
-		OriginalInput:  originalInput,
-		ModifiedInput:  candidate.InputData,
-		ParameterRules: make([]ParameterProtection, 0),
-	}
 
-	// 设置函数选择器
-	if len(candidate.InputData) >= 4 {
-		copy(rule.FunctionSelector[:], candidate.InputData[:4])
-		rule.FunctionName = "modified_function"
-	}
-
-	// 创建一个默认的参数保护规则，确保不为空
-	defaultParam := ParameterProtection{
-		Index:         0,
-		Name:          "param_0",
-		Type:          "bytes",
-		OriginalValue: originalInput,
-		ModifiedValue: candidate.InputData,
-		CheckType:     "exact",
-	}
-	rule.ParameterRules = append(rule.ParameterRules, defaultParam)
-
-	// 如果输入数据长度超过4字节，创建更多参数规则
-	if len(candidate.InputData) > 4 {
-		// 分析输入数据的变化，创建更详细的参数规则
-		paramData := candidate.InputData[4:]
-		if len(paramData) >= 32 {
-			// 假设是uint256参数
-			value := new(big.Int).SetBytes(paramData[:32])
-			param1 := ParameterProtection{
-				Index:         1,
-				Name:          "param_1",
-				Type:          "uint256",
-				OriginalValue: big.NewInt(0),
-				ModifiedValue: value,
-				CheckType:     "range",
-				MinValue:      new(big.Int).Sub(value, big.NewInt(1000)),
-				MaxValue:      new(big.Int).Add(value, big.NewInt(1000)),
-			}
-			rule.ParameterRules = append(rule.ParameterRules, param1)
-		}
-	}
-
-	rule.InputHash = ComputeModificationHash(originalInput, candidate.InputData)
-	return rule
-}
-
-// CreateStorageProtectionRulesFromCandidate 从修改候选创建存储保护规则
-func CreateStorageProtectionRulesFromCandidate(candidate *ModificationCandidate, contractAddr common.Address) []StorageProtectionRule {
-	rules := make([]StorageProtectionRule, 0)
-
-	// 为每个存储变化创建规则
-	for slot, value := range candidate.StorageChanges {
-		// 确保槽位有效
-		if slot == (common.Hash{}) {
-			slot = common.BigToHash(big.NewInt(1)) // 使用槽位1而不是0
-		}
-
-		rule := StorageProtectionRule{
-			ContractAddress: contractAddr,
-			StorageSlot:     slot,
-			OriginalValue:   common.Hash{},
-			ModifiedValue:   value,
-			CheckType:       "exact",
-			SlotType:        ExtractSlotType(slot),
-		}
-
-		// 为数值类型设置范围检查
-		if rule.SlotType == "simple" || rule.SlotType == "mapping" {
-			valueBig := value.Big()
-			if valueBig.Sign() > 0 {
-				rule.CheckType = "range"
-				delta := new(big.Int).Div(valueBig, big.NewInt(10)) // 10%的范围
-				rule.MinValue = new(big.Int).Sub(valueBig, delta)
-				rule.MaxValue = new(big.Int).Add(valueBig, delta)
-
-				if rule.MinValue.Sign() < 0 {
-					rule.MinValue = big.NewInt(0)
-				}
-			}
-		}
-
-		rules = append(rules, rule)
-	}
-
-	// 如果没有存储变化，创建一个默认规则
-	if len(rules) == 0 {
-		defaultRule := StorageProtectionRule{
-			ContractAddress: contractAddr,
-			StorageSlot:     common.BigToHash(big.NewInt(1)), // 使用有效的槽位
-			OriginalValue:   common.Hash{},
-			ModifiedValue:   common.BigToHash(big.NewInt(1)),
-			CheckType:       "exact",
-			SlotType:        "simple",
-		}
-		rules = append(rules, defaultRule)
-	}
-
-	return rules
-}

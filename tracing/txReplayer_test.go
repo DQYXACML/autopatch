@@ -20,7 +20,7 @@ import (
 )
 
 func TestRelayTx(t *testing.T) {
-	const rpcURL = "https://lb.drpc.org/holesky/Avduh2iIjEAksBUYtd4wP1NUPObEnwYR76WEFhW5UfFk"
+	const rpcURL = "https://lb.drpc.org/bsc/Avduh2iIjEAksBUYtd4wP1NUPObEnwYR76WEFhW5UfFk"
 
 	// 连接数据库
 	dsn := "host=172.23.216.120 user=root password=1234 dbname=postgres port=5432 sslmode=disable"
@@ -72,7 +72,7 @@ func TestRelayTx(t *testing.T) {
 	fmt.Println("\n=== STARTING COMPLETE ATTACK TRANSACTION REPLAY, MUTATION COLLECTION AND TRANSACTION SENDING ===")
 
 	// 使用真实的交易哈希和合约地址
-	txHash := common.HexToHash("0x44b10cacbbda290163c152b40b826709815d18c8ac6d478e3efc6b48a6c6dc5e")
+	txHash := common.HexToHash("0x2a65254b41b42f39331a0bcc9f893518d6b106e80d9a476b8ca3816325f4a150")
 	//contractAddr := common.HexToAddress("0x9967407a5B9177E234d7B493AF8ff4A46771BEdf")
 	protectContractAddr := common.HexToAddress("0x9967407a5B9177E234d7B493AF8ff4A46771BEdf")
 
@@ -306,7 +306,7 @@ func TestTransactionSendingOnly(t *testing.T) {
 	testMutations := createTestMutationData()
 
 	// 测试发送变异交易
-	sentTxHashes, err := replayer.sendMutationTransactions(contractAddr, testMutations, TokenGasLimit)
+	sentTxHashes, err := replayer.SendMutationTransactions(contractAddr, testMutations, TokenGasLimit)
 	if err != nil {
 		fmt.Printf("⚠️  Transaction sending failed (this may be expected in test): %v\n", err)
 		// 不直接失败测试，因为在测试环境中交易发送可能失败
