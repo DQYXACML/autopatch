@@ -732,5 +732,3 @@ func DefaultConcurrentModificationConfig() *ConcurrentModificationConfig {
 		BatchSize:           10,
 	}
 }
-
-

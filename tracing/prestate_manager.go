@@ -56,5 +56,3 @@ func (pm *PrestateManager) GetTransactionPrestateWithAllContracts(txHash gethCom
 	fmt.Printf("📦 Total contracts with storage: %d\n", len(allContractsStorage))
 	return result, allContractsStorage, nil
 }
-
-

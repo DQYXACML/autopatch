@@ -106,7 +106,6 @@ func NewInputModifier(metaData *bind.MetaData) (*InputModifier, error) {
 	}, nil
 }
 
-
 // SetOriginalState 设置原始状态用于智能修改
 func (m *InputModifier) SetOriginalState(inputData []byte, storage map[common.Hash]common.Hash) error {
 	m.originalInput = inputData
@@ -133,7 +132,6 @@ func (m *InputModifier) SetOriginalState(inputData []byte, storage map[common.Ha
 
 	return nil
 }
-
 
 // generateStepBasedInputModification 生成基于步长的输入修改
 func (m *InputModifier) generateStepBasedInputModification(strategy string, variant int) (*InputModification, error) {

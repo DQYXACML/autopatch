@@ -147,7 +147,6 @@ func (e *ExecutionEngine) CalculatePathSimilarity(path1, path2 *ExecutionPath) f
 	return float64(matches) / float64(maxLen)
 }
 
-
 // min 辅助函数
 func min(a, b int) int {
 	if a < b {

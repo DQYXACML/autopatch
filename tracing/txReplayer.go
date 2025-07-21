@@ -47,10 +47,10 @@ type AttackReplayer struct {
 	chainID           *big.Int
 
 	// 管理器组件
-	mutationManager  *MutationManager
-	stateManager     *StateManager
-	prestateManager  *PrestateManager
-	executionEngine  *ExecutionEngine
+	mutationManager *MutationManager
+	stateManager    *StateManager
+	prestateManager *PrestateManager
+	executionEngine *ExecutionEngine
 }
 
 // NewAttackReplayer creates a new attack replayer
@@ -250,7 +250,6 @@ func (r *AttackReplayer) SendMutationTransactions(
 	return nil, fmt.Errorf("no transactions were sent")
 }
 
-
 // ReplayAndSendMutations 重放攻击交易、收集变异并发送到合约
 func (r *AttackReplayer) ReplayAndSendMutations(txHash gethCommon.Hash, contractAddr gethCommon.Address) (*MutationCollection, []*gethCommon.Hash, error) {
 	fmt.Printf("=== REPLAY AND SEND MUTATIONS ===\n")
@@ -277,12 +276,6 @@ func (r *AttackReplayer) ReplayAndSendMutations(txHash gethCommon.Hash, contract
 
 	return mutationCollection, txHashes, nil
 }
-
-// ReplayAttackTransactionWithConcurrentModification 使用并发修改重放攻击交易
-
-
-
-
 
 // generateStepBasedModificationCandidates 生成基于步长的修改候选（确保每个候选都有有效修改）
 func (r *AttackReplayer) generateStepBasedModificationCandidates(
@@ -737,8 +730,6 @@ func (r *AttackReplayer) executeMutationBatch(candidates []*ModificationCandidat
 	return results
 }
 
-
-
 // validateProtectionRule 验证保护规则的有效性
 func (r *AttackReplayer) validateProtectionRule(rule *OnChainProtectionRule) bool {
 	// 检查是否有有效规则
@@ -856,13 +847,10 @@ func (r *AttackReplayer) createFallbackProtectionRule(txHash gethCommon.Hash, co
 
 // 保持原有方法的兼容性
 
-
-
 // 保持原有的辅助方法
 func (r *AttackReplayer) executeTransactionWithTracing(tx *types.Transaction, prestate PrestateResult, modifiedInput []byte, storageMods map[gethCommon.Hash]gethCommon.Hash) (*ExecutionPath, error) {
 	return r.executionEngine.ExecuteTransactionWithTracing(tx, prestate, modifiedInput, storageMods)
 }
-
 
 func (r *AttackReplayer) calculatePathSimilarity(path1, path2 *ExecutionPath) float64 {
 	if path1 == nil || path2 == nil {
@@ -898,9 +886,6 @@ func (r *AttackReplayer) calculatePathSimilarity(path1, path2 *ExecutionPath) fl
 
 	return float64(matches) / float64(maxLen)
 }
-
-
-
 
 // getTransactionCallTrace 获取交易的调用跟踪，提取所有被保护合约的调用数据
 func (r *AttackReplayer) getTransactionCallTrace(txHash gethCommon.Hash, protectedContracts []gethCommon.Address) (*CallTrace, error) {

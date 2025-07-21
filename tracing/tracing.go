@@ -39,4 +39,3 @@ func (t *MyTracer) TraceTransaction(txHash common.Hash) error {
 	log.Info("call path calls: ", "calls", path.Calls)
 	return nil
 }
-

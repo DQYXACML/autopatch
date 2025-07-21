@@ -74,7 +74,7 @@ func TestRelayTx(t *testing.T) {
 	// 使用真实的交易哈希和合约地址
 	txHash := common.HexToHash("0x2a65254b41b42f39331a0bcc9f893518d6b106e80d9a476b8ca3816325f4a150")
 	//contractAddr := common.HexToAddress("0x9967407a5B9177E234d7B493AF8ff4A46771BEdf")
-	protectContractAddr := common.HexToAddress("0x9967407a5B9177E234d7B493AF8ff4A46771BEdf")
+	protectContractAddr := common.HexToAddress("0x95e92b09b89cf31fa9f1eca4109a85f88eb08531")
 
 	// 执行完整流程：重放 -> 收集变异 -> 发送交易
 	mutationCollection, sentTxHashes, err := replayer.ReplayAndSendMutations(txHash, protectContractAddr)
@@ -555,8 +555,8 @@ func insertExampleAttackTransaction(db *database.DB, rpcURL string) error {
 	fmt.Println("📥 Inserting example attack transaction...")
 
 	// 指定的交易哈希和合约地址
-	txHash := common.HexToHash("0x44b10cacbbda290163c152b40b826709815d18c8ac6d478e3efc6b48a6c6dc5e")
-	contractAddr := common.HexToAddress("0x9967407a5B9177E234d7B493AF8ff4A46771BEdf")
+	txHash := common.HexToHash("0x2a65254b41b42f39331a0bcc9f893518d6b106e80d9a476b8ca3816325f4a150")
+	contractAddr := common.HexToAddress("0x95e92b09b89cf31fa9f1eca4109a85f88eb08531")
 
 	// 检查交易是否已存在
 	existingTx, err := db.AttackTx.QueryAttackTxByHash(txHash)
