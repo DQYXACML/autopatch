@@ -20,25 +20,20 @@ import (
 )
 
 func TestRelayTx(t *testing.T) {
-	const rpcURL = "https://lb.drpc.org/bsc/Avduh2iIjEAksBUYtd4wP1NUPObEnwYR76WEFhW5UfFk"
+	// 加载测试配置
+	testConfig, err := config.LoadTestConfig()
+	if err != nil {
+		log.Fatal("Failed to load test config:", err)
+	}
 
 	// 连接数据库
-	dsn := "host=172.23.216.120 user=root password=1234 dbname=postgres port=5432 sslmode=disable"
-	gormDB, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	gormDB, err := gorm.Open(postgres.Open(testConfig.GetDSN()), &gorm.Config{})
 	if err != nil {
 		log.Fatal("Failed to connect to database:", err)
 	}
 
 	// 创建数据库实例
-	dbConfig := config.DBConfig{
-		Host:     "172.23.216.120",
-		Port:     5432,
-		Name:     "postgres",
-		User:     "root",
-		Password: "1234",
-	}
-
-	db, err := database.NewDB(context.Background(), dbConfig)
+	db, err := database.NewDB(context.Background(), testConfig.DBConfig)
 	if err != nil {
 		log.Fatal("Failed to create database instance:", err)
 	}
@@ -53,14 +48,14 @@ func TestRelayTx(t *testing.T) {
 	fmt.Println("✅ Database connected and migrated successfully!")
 
 	// 插入测试攻击交易
-	err = insertExampleAttackTransaction(db, rpcURL)
+	err = insertExampleAttackTransaction(db, testConfig.RPCURL)
 	if err != nil {
 		log.Fatal("Failed to insert example transaction:", err)
 	}
 
 	// 创建攻击重放器
 	replayer, err := NewAttackReplayer(
-		rpcURL,                       // 以太坊节点RPC URL
+		testConfig.RPCURL,            // 以太坊节点RPC URL
 		db,                           // 数据库连接
 		bindings.StorageScanMetaData, // StorageScan合约的metadata
 	)
@@ -71,10 +66,9 @@ func TestRelayTx(t *testing.T) {
 	// 测试重放、变异收集和交易发送的完整流程
 	fmt.Println("\n=== STARTING COMPLETE ATTACK TRANSACTION REPLAY, MUTATION COLLECTION AND TRANSACTION SENDING ===")
 
-	// 使用真实的交易哈希和合约地址
-	txHash := common.HexToHash("0x2a65254b41b42f39331a0bcc9f893518d6b106e80d9a476b8ca3816325f4a150")
-	//contractAddr := common.HexToAddress("0x9967407a5B9177E234d7B493AF8ff4A46771BEdf")
-	protectContractAddr := common.HexToAddress("0x95e92b09b89cf31fa9f1eca4109a85f88eb08531")
+	// 使用配置中的交易哈希和合约地址
+	txHash := testConfig.GetTxHash()
+	protectContractAddr := testConfig.GetProtectContractAddress()
 
 	// 执行完整流程：重放 -> 收集变异 -> 发送交易
 	mutationCollection, sentTxHashes, err := replayer.ReplayAndSendMutations(txHash, protectContractAddr)
@@ -191,25 +185,20 @@ func validateTransactionSending(t *testing.T, sentTxHashes []*common.Hash, succe
 
 // TestRelayTxWithoutSending 测试只进行重放和变异收集，不发送交易
 func TestRelayTxWithoutSending(t *testing.T) {
-	const rpcURL = "https://lb.drpc.org/holesky/Avduh2iIjEAksBUYtd4wP1NUPObEnwYR76WEFhW5UfFk"
+	// 加载测试配置
+	testConfig, err := config.LoadTestConfig()
+	if err != nil {
+		log.Fatal("Failed to load test config:", err)
+	}
 
 	// 连接数据库
-	dsn := "host=172.23.216.120 user=root password=1234 dbname=postgres port=5432 sslmode=disable"
-	gormDB, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	gormDB, err := gorm.Open(postgres.Open(testConfig.GetDSN()), &gorm.Config{})
 	if err != nil {
 		log.Fatal("Failed to connect to database:", err)
 	}
 
 	// 创建数据库实例
-	dbConfig := config.DBConfig{
-		Host:     "172.23.216.120",
-		Port:     5432,
-		Name:     "postgres",
-		User:     "root",
-		Password: "1234",
-	}
-
-	db, err := database.NewDB(context.Background(), dbConfig)
+	db, err := database.NewDB(context.Background(), testConfig.DBConfig)
 	if err != nil {
 		log.Fatal("Failed to create database instance:", err)
 	}
@@ -224,14 +213,14 @@ func TestRelayTxWithoutSending(t *testing.T) {
 	fmt.Println("✅ Database connected and migrated successfully!")
 
 	// 插入测试攻击交易
-	err = insertExampleAttackTransaction(db, rpcURL)
+	err = insertExampleAttackTransaction(db, testConfig.RPCURL)
 	if err != nil {
 		log.Fatal("Failed to insert example transaction:", err)
 	}
 
 	// 创建攻击重放器
 	replayer, err := NewAttackReplayer(
-		rpcURL,                       // 以太坊节点RPC URL
+		testConfig.RPCURL,            // 以太坊节点RPC URL
 		db,                           // 数据库连接
 		bindings.StorageScanMetaData, // StorageScan合约的metadata
 	)
@@ -242,9 +231,9 @@ func TestRelayTxWithoutSending(t *testing.T) {
 	// 测试只进行重放和变异收集（不发送交易）
 	fmt.Println("\n=== STARTING ATTACK TRANSACTION REPLAY AND MUTATION COLLECTION (NO SENDING) ===")
 
-	// 使用真实的交易哈希和合约地址
-	txHash := common.HexToHash("0x44b10cacbbda290163c152b40b826709815d18c8ac6d478e3efc6b48a6c6dc5e")
-	contractAddr := common.HexToAddress("0x9967407a5B9177E234d7B493AF8ff4A46771BEdf")
+	// 使用配置中的交易哈希和合约地址
+	txHash := testConfig.GetTxHash()
+	contractAddr := testConfig.GetContractAddress()
 
 	// 执行重放和变异收集
 	mutationCollection, err := replayer.ReplayAndCollectMutations(txHash, contractAddr)
@@ -270,18 +259,14 @@ func TestRelayTxWithoutSending(t *testing.T) {
 
 // TestTransactionSendingOnly 单独测试交易发送功能
 func TestTransactionSendingOnly(t *testing.T) {
-	const rpcURL = "https://lb.drpc.org/holesky/Avduh2iIjEAksBUYtd4wP1NUPObEnwYR76WEFhW5UfFk"
-
-	// 创建数据库实例
-	dbConfig := config.DBConfig{
-		Host:     "172.23.216.120",
-		Port:     5432,
-		Name:     "postgres",
-		User:     "root",
-		Password: "1234",
+	// 加载测试配置
+	testConfig, err := config.LoadTestConfig()
+	if err != nil {
+		log.Fatal("Failed to load test config:", err)
 	}
 
-	db, err := database.NewDB(context.Background(), dbConfig)
+	// 创建数据库实例
+	db, err := database.NewDB(context.Background(), testConfig.DBConfig)
 	if err != nil {
 		log.Fatal("Failed to create database instance:", err)
 	}
@@ -289,7 +274,7 @@ func TestTransactionSendingOnly(t *testing.T) {
 
 	// 创建攻击重放器
 	replayer, err := NewAttackReplayer(
-		rpcURL,                       // 以太坊节点RPC URL
+		testConfig.RPCURL,            // 以太坊节点RPC URL
 		db,                           // 数据库连接
 		bindings.StorageScanMetaData, // StorageScan合约的metadata
 	)
@@ -300,7 +285,7 @@ func TestTransactionSendingOnly(t *testing.T) {
 	fmt.Println("\n=== TESTING TRANSACTION SENDING FUNCTIONALITY ===")
 
 	// 目标合约地址
-	contractAddr := common.HexToAddress("0x9967407a5B9177E234d7B493AF8ff4A46771BEdf")
+	contractAddr := testConfig.GetContractAddress()
 
 	// 创建一些模拟的成功变异数据用于测试发送
 	testMutations := createTestMutationData()
@@ -554,9 +539,15 @@ func validateMutationResults(t *testing.T, collection *MutationCollection) {
 func insertExampleAttackTransaction(db *database.DB, rpcURL string) error {
 	fmt.Println("📥 Inserting example attack transaction...")
 
+	// 加载测试配置获取交易哈希和合约地址
+	testConfig, err := config.LoadTestConfig()
+	if err != nil {
+		return fmt.Errorf("failed to load test config: %v", err)
+	}
+
 	// 指定的交易哈希和合约地址
-	txHash := common.HexToHash("0x2a65254b41b42f39331a0bcc9f893518d6b106e80d9a476b8ca3816325f4a150")
-	contractAddr := common.HexToAddress("0x95e92b09b89cf31fa9f1eca4109a85f88eb08531")
+	txHash := testConfig.GetTxHash()
+	contractAddr := testConfig.GetProtectContractAddress()
 
 	// 检查交易是否已存在
 	existingTx, err := db.AttackTx.QueryAttackTxByHash(txHash)

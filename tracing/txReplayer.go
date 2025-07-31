@@ -664,7 +664,38 @@ func (r *AttackReplayer) applyStepMutationToBytes(data []byte, step int64, varia
 	}
 }
 
-// simulateModification 模拟修改
+// simulateModificationWithContext 使用执行上下文模拟修改
+func (r *AttackReplayer) simulateModificationWithContext(
+	candidate *ModificationCandidate,
+	ctx *ExecutionContext,
+	originalPath *ExecutionPath,
+) *SimulationResult {
+
+	startTime := time.Now()
+	result := &SimulationResult{
+		Candidate: candidate,
+		Success:   false,
+	}
+
+	// 执行修改后的交易 - 使用上下文
+	modifiedPath, err := r.executeTransactionWithContext(ctx, candidate.InputData, candidate.StorageChanges)
+	if err != nil {
+		result.Error = fmt.Errorf("simulation failed: %v", err)
+		result.Duration = time.Since(startTime)
+		return result
+	}
+
+	// 计算相似度
+	similarity := r.calculatePathSimilarity(originalPath, modifiedPath)
+	result.Similarity = similarity
+	result.ExecutePath = modifiedPath
+	result.Success = true
+	result.Duration = time.Since(startTime)
+
+	return result
+}
+
+// simulateModification 模拟修改（保留以兼容旧代码）
 func (r *AttackReplayer) simulateModification(
 	candidate *ModificationCandidate,
 	tx *types.Transaction,
@@ -712,7 +743,25 @@ func (r *AttackReplayer) predictModificationImpact(candidate *ModificationCandid
 
 // createProtectionRuleFromResult 从结果创建保护规则
 
-// executeMutationBatch 并行执行一批变异
+// executeMutationBatchWithContext 使用执行上下文并行执行一批变异
+func (r *AttackReplayer) executeMutationBatchWithContext(candidates []*ModificationCandidate, ctx *ExecutionContext, originalPath *ExecutionPath) []*SimulationResult {
+	results := make([]*SimulationResult, len(candidates))
+
+	// 使用goroutine并行执行
+	var wg sync.WaitGroup
+	for i, candidate := range candidates {
+		wg.Add(1)
+		go func(index int, cand *ModificationCandidate) {
+			defer wg.Done()
+			results[index] = r.simulateModificationWithContext(cand, ctx, originalPath)
+		}(i, candidate)
+	}
+
+	wg.Wait()
+	return results
+}
+
+// executeMutationBatch 并行执行一批变异（保留以兼容旧代码）
 func (r *AttackReplayer) executeMutationBatch(candidates []*ModificationCandidate, tx *types.Transaction, prestate PrestateResult, originalPath *ExecutionPath) []*SimulationResult {
 	results := make([]*SimulationResult, len(candidates))
 
@@ -847,6 +896,11 @@ func (r *AttackReplayer) createFallbackProtectionRule(txHash gethCommon.Hash, co
 
 // 保持原有方法的兼容性
 
+// executeTransactionWithContext 使用执行上下文执行交易
+func (r *AttackReplayer) executeTransactionWithContext(ctx *ExecutionContext, modifiedInput []byte, storageMods map[gethCommon.Hash]gethCommon.Hash) (*ExecutionPath, error) {
+	return r.executionEngine.ExecuteTransactionWithContext(ctx, modifiedInput, storageMods)
+}
+
 // 保持原有的辅助方法
 func (r *AttackReplayer) executeTransactionWithTracing(tx *types.Transaction, prestate PrestateResult, modifiedInput []byte, storageMods map[gethCommon.Hash]gethCommon.Hash) (*ExecutionPath, error) {
 	return r.executionEngine.ExecuteTransactionWithTracing(tx, prestate, modifiedInput, storageMods)
@@ -910,7 +964,7 @@ func (r *AttackReplayer) getTransactionCallTrace(txHash gethCommon.Hash, protect
 		ProtectedContracts: protectedContracts,
 	}
 
-	// 递归提取与被保护合约相关的调用数据
+	// 递归提取与被保护合约相关的调用数据，只提取第一个匹配的
 	r.extractProtectedContractCalls(rootCall, protectedContracts, &callTrace.ExtractedCalls, 0)
 
 	fmt.Printf("Extracted %d calls from protected contracts\n", len(callTrace.ExtractedCalls))
@@ -952,58 +1006,18 @@ func (r *AttackReplayer) convertCallFrame(nodeFrame *node.NodecallFrame) *CallFr
 	return frame
 }
 
-// extractProtectedContractCalls 递归提取与被保护合约相关的调用数据
-func (r *AttackReplayer) extractProtectedContractCalls(frame *CallFrame, protectedContracts []gethCommon.Address, extractedCalls *[]ExtractedCallData, depth int) {
+// extractProtectedContractCalls 递归提取与被保护合约相关的调用数据，只找第一个匹配的
+func (r *AttackReplayer) extractProtectedContractCalls(frame *CallFrame, protectedContracts []gethCommon.Address, extractedCalls *[]ExtractedCallData, depth int) bool {
 	if frame == nil {
-		return
+		return false
 	}
 
-	// 检查当前调用是否来自被保护的合约
+	// 检查调用目标是否为被保护的合约
 	fromAddr := gethCommon.HexToAddress(frame.From)
 	toAddr := gethCommon.HexToAddress(frame.To)
 
-	// 检查 from 字段是否匹配被保护合约
+	// 检查 to 字段，如果调用目标是被保护合约，记录调用数据
 	for _, protectedAddr := range protectedContracts {
-		if fromAddr == protectedAddr {
-			// 提取调用数据
-			inputData, err := hexutil.Decode(frame.Input)
-			if err != nil {
-				fmt.Printf("Warning: failed to decode input data for call from %s: %v\n", fromAddr.Hex(), err)
-				inputData = []byte{}
-			}
-
-			gas := uint64(0)
-			if gasInt, err := hexutil.DecodeUint64(frame.Gas); err == nil {
-				gas = gasInt
-			}
-
-			value := big.NewInt(0)
-			if frame.Value != "" && frame.Value != "0x0" {
-				if valueBig, ok := big.NewInt(0).SetString(frame.Value, 0); ok {
-					value = valueBig
-				}
-			}
-
-			extractedCall := ExtractedCallData{
-				ContractAddress: protectedAddr,
-				From:            fromAddr,
-				InputData:       inputData,
-				CallType:        frame.Type,
-				Value:           value,
-				Gas:             gas,
-				Depth:           depth,
-			}
-
-			*extractedCalls = append(*extractedCalls, extractedCall)
-
-			fmt.Printf("📞 Extracted call from protected contract %s:\n", protectedAddr.Hex())
-			fmt.Printf("   To: %s\n", toAddr.Hex())
-			fmt.Printf("   Input: %x (length: %d)\n", inputData, len(inputData))
-			fmt.Printf("   Depth: %d\n", depth)
-			break
-		}
-
-		// 也检查 to 字段，如果调用目标是被保护合约，也可能需要记录
 		if toAddr == protectedAddr && frame.Input != "" && frame.Input != "0x" {
 			inputData, err := hexutil.Decode(frame.Input)
 			if err != nil {
@@ -1039,14 +1053,18 @@ func (r *AttackReplayer) extractProtectedContractCalls(frame *CallFrame, protect
 			fmt.Printf("   From: %s\n", fromAddr.Hex())
 			fmt.Printf("   Input: %x (length: %d)\n", inputData, len(inputData))
 			fmt.Printf("   Depth: %d\n", depth)
-			break
+			return true // 找到第一个匹配就返回
 		}
 	}
 
-	// 递归处理子调用
+	// 递归处理子调用，如果找到匹配就立即返回
 	for _, subCall := range frame.Calls {
-		r.extractProtectedContractCalls(&subCall, protectedContracts, extractedCalls, depth+1)
+		if r.extractProtectedContractCalls(&subCall, protectedContracts, extractedCalls, depth+1) {
+			return true // 子调用找到匹配，立即返回
+		}
 	}
+	
+	return false // 没有找到匹配
 }
 
 // getTransactionPrestateWithAllContracts 获取交易的预状态，保存所有合约的存储
@@ -1446,6 +1464,29 @@ func (r *AttackReplayer) ReplayAndCollectMutations(txHash gethCommon.Hash, contr
 		return nil, fmt.Errorf("failed to get prestate: %v", err)
 	}
 
+	// 创建执行上下文 - 一次性获取所有需要的信息
+	fmt.Printf("\n=== CREATING EXECUTION CONTEXT ===\n")
+	receipt, err := r.nodeClient.TxReceiptByHash(txHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get receipt: %v", err)
+	}
+
+	block, err := r.nodeClient.BlockHeaderByNumber(receipt.BlockNumber)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block: %v", err)
+	}
+
+	chainID, err := r.client.NetworkID(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get chain ID: %v", err)
+	}
+
+	execCtx, err := NewExecutionContext(tx, receipt, block, chainID, prestate, allContractsStorage)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create execution context: %v", err)
+	}
+	fmt.Printf("✅ Execution context created: ChainID=%s, Block=%d\n", chainID.String(), block.Number.Uint64())
+
 	// 创建变异数据集合
 	mutationCollection := &MutationCollection{
 		OriginalTxHash:      txHash,
@@ -1465,9 +1506,9 @@ func (r *AttackReplayer) ReplayAndCollectMutations(txHash gethCommon.Hash, contr
 		fmt.Printf("Original storage slots for main contract: %d\n", len(contractAccount.Storage))
 	}
 
-	// 执行原始交易
+	// 执行原始交易 - 使用执行上下文
 	fmt.Printf("\n=== ORIGINAL EXECUTION ===\n")
-	originalPath, err := r.executeTransactionWithTracing(tx, prestate, nil, nil)
+	originalPath, err := r.executeTransactionWithContext(execCtx, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute original transaction: %v", err)
 	}
@@ -1518,8 +1559,8 @@ func (r *AttackReplayer) ReplayAndCollectMutations(txHash gethCommon.Hash, contr
 			candidates = r.generateStepBasedModificationCandidates(i, currentBatchSize, tx.Data(), mutationCollection.OriginalStorage)
 		}
 
-		// 并行执行这批变异
-		mutationResults := r.executeMutationBatch(candidates, tx, prestate, originalPath)
+		// 并行执行这批变异 - 使用执行上下文
+		mutationResults := r.executeMutationBatchWithContext(candidates, execCtx, originalPath)
 
 		// 收集结果
 		for _, result := range mutationResults {

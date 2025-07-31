@@ -25,3 +25,9 @@ go.work.sum
 .env
 .idea
 autopatch
+json2yaml
+
+# Test configuration (use test_config.example.json as template)
+test_config.json
+test_config.example.json
+tracing.test

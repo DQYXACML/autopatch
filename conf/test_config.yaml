@@ -1,0 +1,77 @@
+# 测试配置文件
+# 支持默认配置和多个场景配置
+# 优先级：命令行参数 > 环境变量 > 配置文件 > 默认值
+
+# 默认配置
+default:
+  # RPC 节点配置
+  rpcURL: "https://lb.drpc.org/holesky/Avduh2iIjEAksBUYtd4wP1NUPObEnwYR76WEFhW5UfFk"
+  
+  # 数据库配置
+  dbConfig:
+    host: localhost
+    port: 5432
+    name: postgres
+    user: postgres
+    password: postgres
+  
+  # 测试相关地址
+  txHash: "0x2a65254b41b42f39331a0bcc9f893518d6b106e80d9a476b8ca3816325f4a150"
+  contractAddress: "0x9967407a5B9177E234d7B493AF8ff4A46771BEdf"
+  protectContractAddr: "0x95e92b09b89cf31fa9f1eca4109a85f88eb08531"
+
+# 场景配置
+scenarios:
+  # Holesky 测试网配置
+  holesky:
+    rpcURL: "https://lb.drpc.org/holesky/Avduh2iIjEAksBUYtd4wP1NUPObEnwYR76WEFhW5UfFk"
+    dbConfig:
+      host: localhost
+      port: 5432
+      name: postgres
+      user: postgres
+      password: postgres
+    txHash: "0x44b10cacbbda290163c152b40b826709815d18c8ac6d478e3efc6b48a6c6dc5e"
+    contractAddress: "0x9967407a5B9177E234d7B493AF8ff4A46771BEdf"
+    protectContractAddr: "0x95e92b09b89cf31fa9f1eca4109a85f88eb08531"
+  
+  # BSC 测试网配置
+  bsc:
+    rpcURL: "https://tame-fluent-sun.bsc.quiknode.pro/3bfeef12ccb71c4a015a62771a98e51733b09924"
+    dbConfig:
+      host: "172.23.216.120"
+      port: 5432
+      name: postgres
+      user: root
+      password: "1234"
+    txHash: "0x2a65254b41b42f39331a0bcc9f893518d6b106e80d9a476b8ca3816325f4a150"
+    contractAddress: "0x9967407a5B9177E234d7B493AF8ff4A46771BEdf"
+    protectContractAddr: "0x95e92b09b89cf31fa9f1eca4109a85f88eb08531"
+  
+  # 本地开发环境配置
+  local:
+    rpcURL: "http://localhost:8545"
+    dbConfig:
+      host: localhost
+      port: 5432
+      name: autopatch_test
+      user: postgres
+      password: postgres
+    txHash: "0x0000000000000000000000000000000000000000000000000000000000000000"
+    contractAddress: "0x0000000000000000000000000000000000000000"
+    protectContractAddr: "0x0000000000000000000000000000000000000000"
+
+# 测试用例列表（可选）
+# 可以在这里定义多个测试用例，方便批量测试
+testCases:
+  - name: "ERC20 Transfer Test"
+    description: "测试 ERC20 代币转账功能"
+    txHash: "0x2a65254b41b42f39331a0bcc9f893518d6b106e80d9a476b8ca3816325f4a150"
+    contractAddress: "0x9967407a5B9177E234d7B493AF8ff4A46771BEdf"
+    protectContractAddr: "0x95e92b09b89cf31fa9f1eca4109a85f88eb08531"
+  
+  - name: "Uniswap Swap Test"
+    description: "测试 Uniswap 交换功能"
+    txHash: "0x44b10cacbbda290163c152b40b826709815d18c8ac6d478e3efc6b48a6c6dc5e"
+    contractAddress: "0x9967407a5B9177E234d7B493AF8ff4A46771BEdf"
+    protectContractAddr: "0x95e92b09b89cf31fa9f1eca4109a85f88eb08531"

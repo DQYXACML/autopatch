@@ -1,0 +1,49 @@
+default:
+    contractAddress: 0x9967407a5B9177E234d7B493AF8ff4A46771BEdf
+    dbConfig:
+        host: localhost
+        name: postgres
+        password: postgres
+        port: 5432
+        user: postgres
+    protectContractAddr: 0x95e92b09b89cf31fa9f1eca4109a85f88eb08531
+    rpcURL: https://lb.drpc.org/holesky/Avduh2iIjEAksBUYtd4wP1NUPObEnwYR76WEFhW5UfFk
+    scenario: default
+    txHash: 0x2a65254b41b42f39331a0bcc9f893518d6b106e80d9a476b8ca3816325f4a150
+scenarios:
+    bsc:
+        contractAddress: 0x9967407a5B9177E234d7B493AF8ff4A46771BEdf
+        dbConfig:
+            host: 172.23.216.120
+            name: postgres
+            password: "1234"
+            port: 5432
+            user: root
+        protectContractAddr: 0x95e92b09b89cf31fa9f1eca4109a85f88eb08531
+        rpcURL: https://tame-fluent-sun.bsc.quiknode.pro/3bfeef12ccb71c4a015a62771a98e51733b09924
+        scenario: bsc
+        txHash: 0x2a65254b41b42f39331a0bcc9f893518d6b106e80d9a476b8ca3816325f4a150
+    holesky:
+        contractAddress: 0x9967407a5B9177E234d7B493AF8ff4A46771BEdf
+        dbConfig:
+            host: localhost
+            name: postgres
+            password: postgres
+            port: 5432
+            user: postgres
+        protectContractAddr: 0x95e92b09b89cf31fa9f1eca4109a85f88eb08531
+        rpcURL: https://lb.drpc.org/holesky/Avduh2iIjEAksBUYtd4wP1NUPObEnwYR76WEFhW5UfFk
+        scenario: holesky
+        txHash: 0x44b10cacbbda290163c152b40b826709815d18c8ac6d478e3efc6b48a6c6dc5e
+    local:
+        contractAddress: "0x0000000000000000000000000000000000000000"
+        dbConfig:
+            host: localhost
+            name: autopatch_test
+            password: postgres
+            port: 5432
+            user: postgres
+        protectContractAddr: "0x0000000000000000000000000000000000000000"
+        rpcURL: http://localhost:8545
+        scenario: local
+        txHash: "0x0000000000000000000000000000000000000000000000000000000000000000"

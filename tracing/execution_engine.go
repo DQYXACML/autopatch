@@ -30,7 +30,65 @@ func NewExecutionEngine(client *ethclient.Client, nodeClient node.EthClient, sta
 	}
 }
 
-// ExecuteTransactionWithTracing 执行交易并进行跟踪
+// ExecuteTransactionWithContext 使用预获取的上下文执行交易并进行跟踪
+func (e *ExecutionEngine) ExecuteTransactionWithContext(ctx *ExecutionContext, modifiedInput []byte, storageMods map[gethCommon.Hash]gethCommon.Hash) (*ExecutionPath, error) {
+	stateDB, err := e.stateManager.CreateStateFromPrestate(ctx.Prestate)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create state: %v", err)
+	}
+
+	if storageMods != nil && ctx.Transaction.To() != nil {
+		for slot, value := range storageMods {
+			stateDB.SetState(*ctx.Transaction.To(), slot, value)
+		}
+		fmt.Printf("Applied %d storage modifications\n", len(storageMods))
+	}
+
+	evm, err := e.stateManager.CreateEVMWithTracer(stateDB, ctx.Block, ctx.ChainID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create EVM: %v", err)
+	}
+
+	txCtx := vm.TxContext{
+		Origin:   ctx.From,
+		GasPrice: ctx.Transaction.GasPrice(),
+	}
+	evm.SetTxContext(txCtx)
+
+	inputData := ctx.Transaction.Data()
+	if modifiedInput != nil {
+		inputData = modifiedInput
+	}
+
+	e.jumpTracer.StartTrace()
+
+	if ctx.Transaction.To() == nil {
+		_, _, _, err = evm.Create(
+			ctx.From,
+			inputData,
+			ctx.Transaction.Gas(),
+			uint256.MustFromBig(ctx.Transaction.Value()),
+		)
+	} else {
+		_, _, err = evm.Call(
+			ctx.From,
+			*ctx.Transaction.To(),
+			inputData,
+			ctx.Transaction.Gas(),
+			uint256.MustFromBig(ctx.Transaction.Value()),
+		)
+	}
+
+	path := e.jumpTracer.StopTrace()
+
+	if err != nil {
+		fmt.Printf("Transaction execution failed: %v\n", err)
+	}
+
+	return path, nil
+}
+
+// ExecuteTransactionWithTracing 执行交易并进行跟踪（保留原方法以兼容）
 func (e *ExecutionEngine) ExecuteTransactionWithTracing(tx *types.Transaction, prestate PrestateResult, modifiedInput []byte, storageMods map[gethCommon.Hash]gethCommon.Hash) (*ExecutionPath, error) {
 	stateDB, err := e.stateManager.CreateStateFromPrestate(prestate)
 	if err != nil {

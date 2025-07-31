@@ -1,102 +1,95 @@
 # CLAUDE.md
-
+用中文交流
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Overview
+## Overview
 
-AutoPatch is an Ethereum transaction analysis and replay system that detects attack patterns and generates protection mechanisms. The system monitors blockchain transactions, replays them with mutations, and creates on-chain protection rules.
+AutoPatch is an Ethereum transaction tracing and analysis tool that:
+- Traces and analyzes Ethereum transactions using debug APIs
+- Synchronizes blockchain data and stores it in PostgreSQL  
+- Parses and analyzes smart contract storage
+- Provides transaction replay and mutation capabilities
 
-## Core Architecture
-
-The codebase is organized into several key components:
-
-### Main Components
-- **autopatch.go**: Entry point that orchestrates the synchronizer, storage parser, and transaction tracing
-- **cmd/autopatch/**: CLI application with an "index" command that runs the main indexing service
-- **tracing/**: Core transaction replay and mutation analysis engine
-- **synchronizer/**: Blockchain synchronization and node communication
-- **database/**: PostgreSQL data layer with GORM for attack transactions and protected contracts
-- **storage/**: Storage pattern analysis and parsing
-- **txmgr/**: Transaction management and Ethereum interaction utilities
-
-### Key Subsystems
-
-**Transaction Replay Engine (tracing/)**:
-- `AttackReplayer`: Main component that replays attack transactions with mutations
-- `ExecutionEngine`: Handles transaction execution with tracing capabilities  
-- `MutationManager`: Generates step-based modifications to transaction inputs/storage
-- `StateManager`: Manages EVM state creation and manipulation
-- `PrestateManager`: Handles transaction pre-state extraction
-
-**Blockchain Integration**:
-- Uses go-ethereum for EVM interaction and transaction processing
-- Supports multiple RPC endpoints for transaction tracing and state access
-- Integrates with PostgreSQL for persistent storage of analysis results
-
-## Development Commands
+## Commands
 
 ### Build
 ```bash
-make autopatch          # Build the main binary
-go build ./cmd/autopatch # Alternative build command
+make autopatch              # Build the main autopatch binary
+make bindings               # Generate Go bindings from Solidity ABI
 ```
 
 ### Testing
 ```bash
-make test               # Run all tests
-go test -v ./...       # Verbose test output
-go test ./tracing/...  # Test specific package
+make test                   # Run all tests with verbose output
+go test ./tracing -v        # Run tests for a specific package
 ```
 
 ### Linting
 ```bash
-make lint              # Run golangci-lint on all packages
-golangci-lint run ./...
+make lint                   # Run golangci-lint on all Go files
 ```
 
-### Smart Contract Bindings
+### Clean
 ```bash
-make bindings          # Generate Go bindings from ABI artifacts
-make binding-vrf       # Generate StorageScan contract bindings
+make clean                  # Remove built binaries
 ```
 
-## Configuration
-
-The system uses a configuration structure loaded via CLI flags:
-- Database configurations for master/slave PostgreSQL instances
-- Chain configuration including RPC URLs, starting block heights, contract addresses
-- Private keys for transaction signing and contract interaction
-
-## Running the System
-
+### Run the Application
 ```bash
-./autopatch index --chain-rpc-url <RPC_URL> --chain-id <CHAIN_ID> --starting-height <HEIGHT>
+./autopatch index           # Run the indexing service
+./autopatch version         # Print version information
 ```
 
-The main workflow:
-1. Synchronizer monitors blockchain for new transactions
-2. Storage parser analyzes contract storage patterns  
-3. AttackReplayer replays suspicious transactions with mutations
-4. Protection rules are generated and can be deployed on-chain
+## Architecture
 
-## Testing Framework
+### Core Components
 
-The tracing package includes comprehensive tests in `txReplayer_test.go` that demonstrate:
-- Transaction replay with mutation collection
-- Mutation transaction sending to contracts
-- Integration with real blockchain networks (BSC, Holesky testnet)
+1. **AutoPatch** (`autopatch.go`): Main application coordinator that manages:
+   - Database connections
+   - Synchronizer for blockchain data
+   - Storage parser for contract analysis
+   - Lifecycle management (Start/Stop)
 
-## Database Schema
+2. **Tracing Module** (`tracing/`): Transaction analysis engine
+   - `txReplayer.go`: Replays transactions with modifications
+   - `execution_engine.go`: Executes transactions in simulated environment
+   - `state_manager.go`: Manages blockchain state during replay
+   - `mutation_manager.go`: Handles transaction mutations
+   - `call_tracer.go`: Traces EVM call stack
+   - `customTracer.go`: Custom EVM opcode tracer
 
-Key entities:
-- `AttackTx`: Records of detected attack transactions
-- `ProtectedTx`: Protected transaction patterns
-- `ProtectedStorage`: Storage-level protection rules
-- Block and address tracking for synchronization
+3. **Synchronizer** (`synchronizer/`): Blockchain data synchronization
+   - Fetches headers, blocks, and transactions
+   - Manages connection to Ethereum nodes
+   - Handles chain reorganizations
 
-## Important Notes
+4. **Storage Module** (`storage/`): Smart contract storage analysis
+   - Parses storage layouts
+   - Analyzes mappings, arrays, and structs
+   - Uses StorageScan contract for on-chain queries
 
-- The system requires PostgreSQL for persistent storage
-- EVM tracing capabilities require archive node access or debug API support
-- Transaction mutation testing can generate significant network traffic
-- Private key management is required for sending protection transactions
+5. **Database** (`database/`): PostgreSQL data persistence
+   - Uses GORM for ORM functionality
+   - Custom serializers for Ethereum types (addresses, uint256, RLP)
+   - Worker modules for different data types
+
+### Key Design Patterns
+
+- **Lifecycle Management**: Components implement `cliapp.Lifecycle` interface with Start/Stop methods
+- **Configuration**: Centralized config loading via flags and config files
+- **Error Handling**: Consistent error propagation with context
+- **Logging**: Uses go-ethereum's structured logging throughout
+
+### Database Schema
+
+The application uses PostgreSQL with migrations in `migrations/`. Key tables include:
+- Block and transaction data
+- Protected addresses and storage
+- Attack transaction analysis results
+
+### External Dependencies
+
+- `go-ethereum`: Core Ethereum libraries
+- `gorm`: Database ORM
+- `urfave/cli`: Command-line interface
+- Custom StorageScan Solidity contract for on-chain storage queries
