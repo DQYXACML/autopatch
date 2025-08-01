@@ -1,4 +1,4 @@
-package tracing
+package replay
 
 import (
 	"context"
@@ -6,18 +6,28 @@ import (
 	"fmt"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"math/big"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/DQYXACML/autopatch/database"
 	"github.com/DQYXACML/autopatch/database/common"
+	"github.com/DQYXACML/autopatch/database/utils"
 	"github.com/DQYXACML/autopatch/synchronizer/node"
 	"github.com/DQYXACML/autopatch/txmgr/ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	gethCommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	abiPkg "github.com/DQYXACML/autopatch/tracing/abi"
+	"github.com/DQYXACML/autopatch/tracing/analysis"
+	"github.com/DQYXACML/autopatch/tracing/core"
+	"github.com/DQYXACML/autopatch/tracing/mutation"
+	"github.com/DQYXACML/autopatch/tracing/state"
+	tracingUtils "github.com/DQYXACML/autopatch/tracing/utils"
 )
 
 var (
@@ -27,30 +37,50 @@ var (
 	maxPriorityFeePerGas        = big.NewInt(2600000000)
 )
 
+// bytesEqual 比较两个字节数组是否相等
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // AttackReplayer handles attack transaction replay and analysis
 type AttackReplayer struct {
 	client              *ethclient.Client
 	nodeClient          node.EthClient
-	jumpTracer          *JumpTracer
-	inputModifier       *InputModifier
+	jumpTracer          *tracingUtils.JumpTracer
+	inputModifier       *mutation.InputModifier
 	db                  *database.DB
 	addressesDB         common.AddressesDB
 	similarityThreshold float64
 	maxVariations       int
 
-	// 新增：并发修改相关字段
-	concurrentConfig  *ConcurrentModificationConfig
+	// Concurrent modification related fields
+	concurrentConfig  *tracingUtils.ConcurrentModificationConfig
 	transactionSender *ethereum.BatchTransactionSender
 	privateKey        string
-	privateKeyECDSA   *ecdsa.PrivateKey  // 新增：存储解析后的私钥
-	fromAddress       gethCommon.Address // 新增：存储发送者地址
+	privateKeyECDSA   *ecdsa.PrivateKey  // Parsed private key
+	fromAddress       gethCommon.Address // Sender address
 	chainID           *big.Int
 
-	// 管理器组件
-	mutationManager *MutationManager
-	stateManager    *StateManager
-	prestateManager *PrestateManager
-	executionEngine *ExecutionEngine
+	// Manager components
+	mutationManager *mutation.MutationManager
+	stateManager    *state.StateManager
+	prestateManager *state.PrestateManager
+	executionEngine *core.ExecutionEngine
+	
+	// Smart mutation components
+	smartStrategy   *mutation.SmartMutationStrategy
+	abiManager      *abiPkg.ABIManager
+	typeAwareMutator *mutation.TypeAwareMutator
+	storageAnalyzer *analysis.StorageAnalyzer
+	storageTypeMutator *analysis.StorageTypeMutator
 }
 
 // NewAttackReplayer creates a new attack replayer
@@ -61,33 +91,45 @@ func NewAttackReplayer(rpcURL string, db *database.DB, contractsMetadata *bind.M
 		return nil, err
 	}
 
-	inputModifier, err := NewInputModifier(contractsMetadata)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create input modifier: %v", err)
-	}
-
-	// 创建批量交易发送器
-	batchSender, err := ethereum.NewBatchTransactionSender(nodeClient, 4)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create batch transaction sender: %v", err)
-	}
-
-	// 获取链ID
+	// Get chain ID
 	chainID, err := client.NetworkID(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get chain ID: %v", err)
 	}
 
-	// 写死私钥在程序里
-	hardcodedPrivateKey := "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" // 示例私钥，实际使用时请替换
+	// Create ABI manager
+	abiManager := abiPkg.NewABIManager("./abi_cache")
+	fmt.Printf("🔧 ABI Manager created for chain %s\n", chainID.String())
 
-	// 解析私钥
-	privateKeyECDSA, err := crypto.HexToECDSA(hardcodedPrivateKey)
+	// Create type-aware mutator
+	typeAwareMutator := mutation.NewTypeAwareMutator(chainID, abiManager)
+	fmt.Printf("🧬 Type-aware mutator created\n")
+
+	// Create InputModifier (using original approach first)
+	inputModifier, err := mutation.NewInputModifier(contractsMetadata)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create input modifier: %v", err)
+	}
+
+	// Create batch transaction sender
+	batchSender, err := ethereum.NewBatchTransactionSender(nodeClient, 4)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create batch transaction sender: %v", err)
+	}
+
+	// Load private key from environment variable for security
+	privateKeyHex := os.Getenv("AUTOPATCH_PRIVATE_KEY")
+	if privateKeyHex == "" {
+		return nil, fmt.Errorf("AUTOPATCH_PRIVATE_KEY environment variable not set - required for transaction signing")
+	}
+
+	// Parse private key
+	privateKeyECDSA, err := crypto.HexToECDSA(privateKeyHex)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse private key: %v", err)
 	}
 
-	// 计算发送者地址
+	// Calculate sender address
 	fromAddress := crypto.PubkeyToAddress(privateKeyECDSA.PublicKey)
 
 	fmt.Printf("=== ATTACK REPLAYER INITIALIZED ===\n")
@@ -95,14 +137,22 @@ func NewAttackReplayer(rpcURL string, db *database.DB, contractsMetadata *bind.M
 	fmt.Printf("Chain ID: %s\n", chainID.String())
 	fmt.Printf("RPC URL: %s\n", rpcURL)
 
-	// 创建组件管理器
-	jumpTracer := NewJumpTracer()
-	stateManager := NewStateManager(jumpTracer)
-	prestateManager := NewPrestateManager(client)
-	executionEngine := NewExecutionEngine(client, nodeClient, stateManager, jumpTracer)
-	mutationManager := NewMutationManager(DefaultMutationConfig(), inputModifier)
+	// Create smart mutation components
+	smartStrategy := mutation.NewSmartMutationStrategy(0.8)
+	storageAnalyzer := analysis.NewStorageAnalyzer(abiManager, chainID)
+	storageTypeMutator := analysis.NewStorageTypeMutator(storageAnalyzer, typeAwareMutator)
+	
+	fmt.Printf("🧠 Smart mutation strategy created\n")
+	fmt.Printf("🔍 Storage analyzer created\n")
 
-	return &AttackReplayer{
+	// Create component managers
+	jumpTracer := tracingUtils.NewJumpTracer()
+	stateManager := state.NewStateManager(jumpTracer)
+	prestateManager := state.NewPrestateManager(client)
+	executionEngine := core.NewExecutionEngine(client, nodeClient, stateManager, jumpTracer)
+	mutationManager := mutation.NewMutationManager(mutation.DefaultMutationConfig(), inputModifier)
+
+	replayer := &AttackReplayer{
 		client:              client,
 		nodeClient:          nodeClient,
 		jumpTracer:          jumpTracer,
@@ -111,9 +161,9 @@ func NewAttackReplayer(rpcURL string, db *database.DB, contractsMetadata *bind.M
 		addressesDB:         db.Addresses,
 		similarityThreshold: 0.8,
 		maxVariations:       20,
-		concurrentConfig:    DefaultConcurrentModificationConfig(),
+		concurrentConfig:    tracingUtils.DefaultConcurrentModificationConfig(),
 		transactionSender:   batchSender,
-		privateKey:          hardcodedPrivateKey,
+		privateKey:          privateKeyHex,
 		privateKeyECDSA:     privateKeyECDSA,
 		fromAddress:         fromAddress,
 		chainID:             chainID,
@@ -121,12 +171,211 @@ func NewAttackReplayer(rpcURL string, db *database.DB, contractsMetadata *bind.M
 		stateManager:        stateManager,
 		prestateManager:     prestateManager,
 		executionEngine:     executionEngine,
-	}, nil
+		// Smart mutation components
+		smartStrategy:      smartStrategy,
+		abiManager:         abiManager,
+		typeAwareMutator:   typeAwareMutator,
+		storageAnalyzer:    storageAnalyzer,
+		storageTypeMutator: storageTypeMutator,
+	}
+
+	// Initialize ABI manager API keys
+	replayer.initializeABIManager(abiManager, typeAwareMutator)
+
+	return replayer, nil
 }
 
-// SetMutationConfig 设置变异配置
+// initializeABIManager Initialize ABI manager
+func (r *AttackReplayer) initializeABIManager(abiManager *abiPkg.ABIManager, typeAwareMutator *mutation.TypeAwareMutator) {
+	// Set API keys from environment variables or config file
+	etherscanKey := os.Getenv("ETHERSCAN_API_KEY")
+	bscscanKey := os.Getenv("BSCSCAN_API_KEY")
+	
+	if etherscanKey != "" {
+		abiManager.SetAPIKey(1, etherscanKey) // Ethereum
+		fmt.Printf("🔑 Etherscan API key configured\n")
+	} else {
+		fmt.Printf("⚠️  No Etherscan API key found in environment\n")
+	}
+	
+	if bscscanKey != "" {
+		abiManager.SetAPIKey(56, bscscanKey) // BSC
+		fmt.Printf("🔑 BscScan API key configured\n")
+	} else {
+		fmt.Printf("⚠️  No BscScan API key found in environment\n")
+	}
+	
+	// Display ABI manager status
+	stats := abiManager.GetCacheStats()
+	fmt.Printf("📋 ABI Cache: %d in memory, %d in files\n", 
+		stats["memory_cache_size"], stats["file_cache_size"])
+}
 
-// sendTransactionToContract 发送交易到合约
+// EnableTypeAwareMutation Enable type-aware mutation for specific contract
+func (r *AttackReplayer) EnableTypeAwareMutation(contractAddr gethCommon.Address) error {
+	if r.inputModifier == nil {
+		return fmt.Errorf("input modifier not initialized")
+	}
+
+	// Create ABI manager and type-aware mutator (if not already created)
+	abiManager := abiPkg.NewABIManager("./abi_cache")
+	typeAwareMutator := mutation.NewTypeAwareMutator(r.chainID, abiManager)
+	
+	// Initialize API keys
+	r.initializeABIManager(abiManager, typeAwareMutator)
+
+	// Enable type-aware mutation
+	r.inputModifier.EnableTypeAwareMutation(abiManager, typeAwareMutator, r.chainID, contractAddr)
+	
+	fmt.Printf("✅ Type-aware mutation enabled for contract %s\n", contractAddr.Hex())
+	return nil
+}
+
+// DisableTypeAwareMutation Disable type-aware mutation
+func (r *AttackReplayer) DisableTypeAwareMutation() {
+	if r.inputModifier != nil {
+		r.inputModifier.DisableTypeAwareMutation()
+	}
+}
+
+// GetContractABI Get contract ABI (helper method)
+func (r *AttackReplayer) GetContractABI(contractAddr gethCommon.Address) (*abi.ABI, error) {
+	abiManager := abiPkg.NewABIManager("./abi_cache")
+	r.initializeABIManager(abiManager, nil)
+	
+	return abiManager.GetContractABI(r.chainID, contractAddr)
+}
+
+// AnalyzeContract Analyze contract structure
+func (r *AttackReplayer) AnalyzeContract(contractAddr gethCommon.Address) (*ContractAnalysis, error) {
+	contractABI, err := r.GetContractABI(contractAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get contract ABI: %v", err)
+	}
+
+	analysis := &ContractAnalysis{
+		Address: contractAddr,
+		ChainID: r.chainID,
+		ABI:     contractABI,
+		Methods: make([]MethodAnalysis, 0, len(contractABI.Methods)),
+	}
+
+	// Analyze each method
+	for name, method := range contractABI.Methods {
+		methodAnalysis := MethodAnalysis{
+			Name:      name,
+			Signature: method.Sig,
+			Inputs:    make([]ParameterAnalysis, len(method.Inputs)),
+		}
+
+		// Analyze each parameter
+		for i, input := range method.Inputs {
+			importance := r.calculateParameterImportanceScore(input)
+			methodAnalysis.Inputs[i] = ParameterAnalysis{
+				Name:        input.Name,
+				Type:        input.Type.String(),
+				Importance:  importance,
+				Strategies:  r.getMutationStrategies(input.Type),
+			}
+		}
+
+		analysis.Methods = append(analysis.Methods, methodAnalysis)
+	}
+
+	return analysis, nil
+}
+
+// calculateParameterImportanceScore Calculate parameter importance score
+func (r *AttackReplayer) calculateParameterImportanceScore(input abi.Argument) float64 {
+	// 基本重要性评分逻辑
+	importance := 0.5 // 默认分数
+	
+	// 根据参数类型增加重要性
+	switch input.Type.T {
+	case abi.AddressTy:
+		importance += 0.3 // 地址类型通常很重要
+	case abi.UintTy, abi.IntTy:
+		if input.Type.Size >= 256 {
+			importance += 0.2 // 大整数类型
+		} else {
+			importance += 0.1 // 小整数类型
+		}
+	case abi.BoolTy:
+		importance += 0.1 // 布尔类型
+	case abi.StringTy, abi.BytesTy:
+		importance += 0.15 // 字符串和字节类型
+	}
+	
+	// 根据参数名称增加重要性
+	nameBoost := r.calculateNameImportance(input.Name)
+	importance += nameBoost
+	
+	// 确保分数在合理范围内
+	if importance > 1.0 {
+		importance = 1.0
+	}
+	if importance < 0.1 {
+		importance = 0.1
+	}
+	
+	return importance
+}
+
+// calculateNameImportance 根据参数名称计算重要性加成
+func (r *AttackReplayer) calculateNameImportance(name string) float64 {
+	// 转换为小写进行匹配
+	lowerName := strings.ToLower(name)
+	
+	// 高重要性关键词
+	highImportance := []string{"amount", "value", "price", "balance", "token", "address", "owner", "admin"}
+	for _, keyword := range highImportance {
+		if strings.Contains(lowerName, keyword) {
+			return 0.3
+		}
+	}
+	
+	// 中等重要性关键词
+	mediumImportance := []string{"id", "index", "count", "limit", "max", "min"}
+	for _, keyword := range mediumImportance {
+		if strings.Contains(lowerName, keyword) {
+			return 0.2
+		}
+	}
+	
+	// 低重要性关键词
+	lowImportance := []string{"data", "info", "meta", "extra"}
+	for _, keyword := range lowImportance {
+		if strings.Contains(lowerName, keyword) {
+			return 0.1
+		}
+	}
+	
+	return 0.0 // 无匹配
+}
+
+// getMutationStrategies Get mutation strategies for type
+func (r *AttackReplayer) getMutationStrategies(argType abi.Type) []string {
+	strategies := []string{"step_based"}
+	
+	switch argType.T {
+	case abi.AddressTy:
+		strategies = append(strategies, "known_addresses", "nearby_addresses", "zero_address")
+	case abi.UintTy, abi.IntTy:
+		strategies = append(strategies, "boundary_values", "bit_patterns", "multiplication")
+	case abi.BoolTy:
+		strategies = append(strategies, "toggle")
+	case abi.StringTy:
+		strategies = append(strategies, "length_mutation", "encoding_mutation", "special_chars")
+	case abi.BytesTy:
+		strategies = append(strategies, "byte_flip", "length_change", "pattern_fill")
+	}
+	
+	return strategies
+}
+
+// SetMutationConfig Set mutation configuration
+
+// sendTransactionToContract Send transaction to contract
 func (r *AttackReplayer) sendTransactionToContract(
 	contractAddr gethCommon.Address,
 	inputData []byte,
@@ -137,7 +386,7 @@ func (r *AttackReplayer) sendTransactionToContract(
 		return nil, fmt.Errorf("private key not set")
 	}
 
-	// 1. 获取nonce值
+	// 1. Get nonce value
 	nonce, err := r.nodeClient.TxCountByAddress(r.fromAddress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get nonce: %v", err)
@@ -145,7 +394,7 @@ func (r *AttackReplayer) sendTransactionToContract(
 
 	fmt.Printf("🔢 Current nonce for %s: %d\n", r.fromAddress.Hex(), uint64(nonce))
 
-	// 2. 创建交易数据结构
+	// 2. Create transaction data structure
 	txData := &types.DynamicFeeTx{
 		ChainID:   r.chainID,
 		Nonce:     uint64(nonce),
@@ -166,7 +415,7 @@ func (r *AttackReplayer) sendTransactionToContract(
 		fmt.Printf("   Function selector: %x\n", inputData[:4])
 	}
 
-	// 3. 离线签名交易
+	// 3. Sign transaction offline
 	rawTxHex, txHashStr, err := ethereum.OfflineSignTx(txData, r.privateKey, r.chainID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sign transaction: %v", err)
@@ -176,7 +425,7 @@ func (r *AttackReplayer) sendTransactionToContract(
 	fmt.Printf("   Tx Hash: %s\n", txHashStr)
 	fmt.Printf("   Raw Tx length: %d bytes\n", len(rawTxHex))
 
-	// 4. 发送原始交易
+	// 4. Send raw transaction
 	err = r.nodeClient.SendRawTransaction(rawTxHex)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send transaction: %v", err)
@@ -188,10 +437,10 @@ func (r *AttackReplayer) sendTransactionToContract(
 	return &txHash, nil
 }
 
-// SendMutationTransactions 发送变异交易到合约
+// SendMutationTransactions Send mutation transactions to contract
 func (r *AttackReplayer) SendMutationTransactions(
 	contractAddr gethCommon.Address,
-	mutations []MutationData,
+	mutations []tracingUtils.MutationData,
 	gasLimit uint64,
 ) ([]*gethCommon.Hash, error) {
 	if len(mutations) == 0 {
@@ -206,14 +455,14 @@ func (r *AttackReplayer) SendMutationTransactions(
 	for i, mutation := range mutations {
 		fmt.Printf("\n--- Sending mutation %d/%d (ID: %s) ---\n", i+1, len(mutations), mutation.ID)
 
-		// 确保有修改的输入数据
+		// Ensure there is modified input data
 		inputData := mutation.InputData
 		if len(inputData) == 0 {
 			fmt.Printf("⚠️  Mutation %s has no input data, skipping\n", mutation.ID)
 			continue
 		}
 
-		// 发送交易
+		// Send transaction
 		txHash, err := r.sendTransactionToContract(contractAddr, inputData, mutation.StorageChanges, gasLimit)
 		if err != nil {
 			fmt.Printf("❌ Failed to send mutation %s: %v\n", mutation.ID, err)
@@ -224,7 +473,7 @@ func (r *AttackReplayer) SendMutationTransactions(
 		txHashes = append(txHashes, txHash)
 		fmt.Printf("✅ Mutation %s sent: %s\n", mutation.ID, txHash.Hex())
 
-		// 添加小延迟避免nonce冲突
+		// Add small delay to avoid nonce conflict
 		time.Sleep(1 * time.Second)
 	}
 
@@ -237,12 +486,12 @@ func (r *AttackReplayer) SendMutationTransactions(
 		}
 	}
 
-	// 如果有部分成功，返回成功的交易哈希
+	// If partially successful, return successful transaction hashes
 	if len(txHashes) > 0 {
 		return txHashes, nil
 	}
 
-	// 如果全部失败，返回第一个错误
+	// If all failed, return the first error
 	if len(errors) > 0 {
 		return nil, errors[0]
 	}
@@ -250,17 +499,17 @@ func (r *AttackReplayer) SendMutationTransactions(
 	return nil, fmt.Errorf("no transactions were sent")
 }
 
-// ReplayAndSendMutations 重放攻击交易、收集变异并发送到合约
-func (r *AttackReplayer) ReplayAndSendMutations(txHash gethCommon.Hash, contractAddr gethCommon.Address) (*MutationCollection, []*gethCommon.Hash, error) {
+// ReplayAndSendMutations Replay attack transaction, collect mutations and send to contract
+func (r *AttackReplayer) ReplayAndSendMutations(txHash gethCommon.Hash, contractAddr gethCommon.Address) (*tracingUtils.MutationCollection, []*gethCommon.Hash, error) {
 	fmt.Printf("=== REPLAY AND SEND MUTATIONS ===\n")
 
-	// 1. 重放并收集变异
+	// 1. Replay and collect mutations
 	mutationCollection, err := r.ReplayAndCollectMutations(txHash, contractAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to replay and collect mutations: %v", err)
 	}
 
-	// 2. 发送成功的变异到合约
+	// 2. Send successful mutations to contract
 	if len(mutationCollection.SuccessfulMutations) == 0 {
 		fmt.Printf("⚠️  No successful mutations to send\n")
 		return mutationCollection, nil, nil
@@ -271,24 +520,24 @@ func (r *AttackReplayer) ReplayAndSendMutations(txHash gethCommon.Hash, contract
 	txHashes, err := r.SendMutationTransactions(contractAddr, mutationCollection.SuccessfulMutations, TokenGasLimit)
 	if err != nil {
 		fmt.Printf("❌ Failed to send some or all mutation transactions: %v\n", err)
-		// 不返回错误，因为收集变异是成功的
+		// Don't return error because mutation collection was successful
 	}
 
 	return mutationCollection, txHashes, nil
 }
 
-// generateStepBasedModificationCandidates 生成基于步长的修改候选（确保每个候选都有有效修改）
+// generateStepBasedModificationCandidates Generate step-based modification candidates (ensure each candidate has valid modifications)
 func (r *AttackReplayer) generateStepBasedModificationCandidates(
 	startID int,
 	count int,
 	originalInput []byte,
 	originalStorage map[gethCommon.Hash]gethCommon.Hash,
-) []*ModificationCandidate {
+) []*tracingUtils.ModificationCandidate {
 
-	candidates := make([]*ModificationCandidate, 0, count)
+	candidates := make([]*tracingUtils.ModificationCandidate, 0, count)
 
 	for i := 0; i < count; i++ {
-		candidate := &ModificationCandidate{
+		candidate := &tracingUtils.ModificationCandidate{
 			ID:             fmt.Sprintf("step_candidate_%d", startID+i),
 			GeneratedAt:    time.Now(),
 			StorageChanges: make(map[gethCommon.Hash]gethCommon.Hash),
@@ -354,7 +603,7 @@ func (r *AttackReplayer) generateStepBasedModificationCandidates(
 
 // forceValidModification 强制生成有效的修改
 func (r *AttackReplayer) forceValidModification(
-	candidate *ModificationCandidate,
+	candidate *tracingUtils.ModificationCandidate,
 	originalInput []byte,
 	originalStorage map[gethCommon.Hash]gethCommon.Hash,
 	variant int,
@@ -666,19 +915,35 @@ func (r *AttackReplayer) applyStepMutationToBytes(data []byte, step int64, varia
 
 // simulateModificationWithContext 使用执行上下文模拟修改
 func (r *AttackReplayer) simulateModificationWithContext(
-	candidate *ModificationCandidate,
-	ctx *ExecutionContext,
-	originalPath *ExecutionPath,
-) *SimulationResult {
+	candidate *tracingUtils.ModificationCandidate,
+	ctx *tracingUtils.ExecutionContext,
+	originalPath *tracingUtils.ExecutionPath,
+) *tracingUtils.SimulationResult {
 
 	startTime := time.Now()
-	result := &SimulationResult{
+	result := &tracingUtils.SimulationResult{
 		Candidate: candidate,
 		Success:   false,
 	}
 
-	// 执行修改后的交易 - 使用上下文
-	modifiedPath, err := r.executeTransactionWithContext(ctx, candidate.InputData, candidate.StorageChanges)
+	// Create target calls map for intercepted execution
+	targetCalls := make(map[gethCommon.Address][]byte)
+	
+	// If candidate has source call data, use its contract address
+	if candidate.SourceCallData != nil && len(candidate.InputData) > 0 {
+		targetCalls[candidate.SourceCallData.ContractAddress] = candidate.InputData
+	} else if len(candidate.InputData) > 0 {
+		// Fallback: use the main contract address from ctx
+		if ctx.Transaction.To() != nil {
+			targetCalls[*ctx.Transaction.To()] = candidate.InputData
+		}
+	}
+	
+	// Apply storage modifications to target calls
+	// Note: storage mods are applied in ExecuteWithInterceptedCalls via ctx.AllContractsStorage
+
+	// Execute with intercepted calls
+	modifiedPath, err := r.executionEngine.ExecuteWithInterceptedCalls(ctx, targetCalls)
 	if err != nil {
 		result.Error = fmt.Errorf("simulation failed: %v", err)
 		result.Duration = time.Since(startTime)
@@ -697,14 +962,14 @@ func (r *AttackReplayer) simulateModificationWithContext(
 
 // simulateModification 模拟修改（保留以兼容旧代码）
 func (r *AttackReplayer) simulateModification(
-	candidate *ModificationCandidate,
+	candidate *tracingUtils.ModificationCandidate,
 	tx *types.Transaction,
-	prestate PrestateResult,
-	originalPath *ExecutionPath,
-) *SimulationResult {
+	prestate tracingUtils.PrestateResult,
+	originalPath *tracingUtils.ExecutionPath,
+) *tracingUtils.SimulationResult {
 
 	startTime := time.Now()
-	result := &SimulationResult{
+	result := &tracingUtils.SimulationResult{
 		Candidate: candidate,
 		Success:   false,
 	}
@@ -728,7 +993,7 @@ func (r *AttackReplayer) simulateModification(
 }
 
 // predictModificationImpact 预测修改影响
-func (r *AttackReplayer) predictModificationImpact(candidate *ModificationCandidate) string {
+func (r *AttackReplayer) predictModificationImpact(candidate *tracingUtils.ModificationCandidate) string {
 	switch candidate.ModType {
 	case "input_step":
 		return "step_based_input_behavior_change"
@@ -744,14 +1009,14 @@ func (r *AttackReplayer) predictModificationImpact(candidate *ModificationCandid
 // createProtectionRuleFromResult 从结果创建保护规则
 
 // executeMutationBatchWithContext 使用执行上下文并行执行一批变异
-func (r *AttackReplayer) executeMutationBatchWithContext(candidates []*ModificationCandidate, ctx *ExecutionContext, originalPath *ExecutionPath) []*SimulationResult {
-	results := make([]*SimulationResult, len(candidates))
+func (r *AttackReplayer) executeMutationBatchWithContext(candidates []*tracingUtils.ModificationCandidate, ctx *tracingUtils.ExecutionContext, originalPath *tracingUtils.ExecutionPath) []*tracingUtils.SimulationResult {
+	results := make([]*tracingUtils.SimulationResult, len(candidates))
 
 	// 使用goroutine并行执行
 	var wg sync.WaitGroup
 	for i, candidate := range candidates {
 		wg.Add(1)
-		go func(index int, cand *ModificationCandidate) {
+		go func(index int, cand *tracingUtils.ModificationCandidate) {
 			defer wg.Done()
 			results[index] = r.simulateModificationWithContext(cand, ctx, originalPath)
 		}(i, candidate)
@@ -762,14 +1027,14 @@ func (r *AttackReplayer) executeMutationBatchWithContext(candidates []*Modificat
 }
 
 // executeMutationBatch 并行执行一批变异（保留以兼容旧代码）
-func (r *AttackReplayer) executeMutationBatch(candidates []*ModificationCandidate, tx *types.Transaction, prestate PrestateResult, originalPath *ExecutionPath) []*SimulationResult {
-	results := make([]*SimulationResult, len(candidates))
+func (r *AttackReplayer) executeMutationBatch(candidates []*tracingUtils.ModificationCandidate, tx *types.Transaction, prestate tracingUtils.PrestateResult, originalPath *tracingUtils.ExecutionPath) []*tracingUtils.SimulationResult {
+	results := make([]*tracingUtils.SimulationResult, len(candidates))
 
 	// 使用goroutine并行执行
 	var wg sync.WaitGroup
 	for i, candidate := range candidates {
 		wg.Add(1)
-		go func(index int, cand *ModificationCandidate) {
+		go func(index int, cand *tracingUtils.ModificationCandidate) {
 			defer wg.Done()
 			results[index] = r.simulateModification(cand, tx, prestate, originalPath)
 		}(i, candidate)
@@ -780,7 +1045,7 @@ func (r *AttackReplayer) executeMutationBatch(candidates []*ModificationCandidat
 }
 
 // validateProtectionRule 验证保护规则的有效性
-func (r *AttackReplayer) validateProtectionRule(rule *OnChainProtectionRule) bool {
+func (r *AttackReplayer) validateProtectionRule(rule *tracingUtils.OnChainProtectionRule) bool {
 	// 检查是否有有效规则
 	if len(rule.InputRules) == 0 && len(rule.StorageRules) == 0 {
 		fmt.Printf("    ⚠️  Rule has no input or storage rules\n")
@@ -816,24 +1081,24 @@ func (r *AttackReplayer) validateProtectionRule(rule *OnChainProtectionRule) boo
 
 // createProtectionRule 创建链上防护规则
 func (r *AttackReplayer) createProtectionRule(txHash gethCommon.Hash, contractAddr gethCommon.Address,
-	similarity float64, variation *ModificationVariation) OnChainProtectionRule {
+	similarity float64, variation *tracingUtils.ModificationVariation) tracingUtils.OnChainProtectionRule {
 
-	ruleID := GenerateRuleID(txHash, contractAddr, time.Now())
+	ruleID := tracingUtils.GenerateRuleID(txHash, contractAddr, time.Now())
 
-	rule := OnChainProtectionRule{
+	rule := tracingUtils.OnChainProtectionRule{
 		RuleID:          ruleID,
 		TxHash:          txHash,
 		ContractAddress: contractAddr,
 		Similarity:      similarity,
-		InputRules:      make([]InputProtectionRule, 0),
-		StorageRules:    make([]StorageProtectionRule, 0),
+		InputRules:      make([]tracingUtils.InputProtectionRule, 0),
+		StorageRules:    make([]tracingUtils.StorageProtectionRule, 0),
 		CreatedAt:       time.Now(),
 		IsActive:        true,
 	}
 
 	// 生成输入保护规则
 	if variation.InputMod != nil {
-		inputRule := CreateInputProtectionRule(variation.InputMod)
+		inputRule := tracingUtils.CreateInputProtectionRule(variation.InputMod)
 		// 验证输入规则是否有效
 		if len(inputRule.FunctionSelector) == 4 && len(inputRule.ParameterRules) > 0 {
 			rule.InputRules = append(rule.InputRules, inputRule)
@@ -842,7 +1107,7 @@ func (r *AttackReplayer) createProtectionRule(txHash gethCommon.Hash, contractAd
 
 	// 生成存储保护规则
 	if variation.StorageMod != nil {
-		storageRules := CreateStorageProtectionRules(variation.StorageMod, contractAddr)
+		storageRules := tracingUtils.CreateStorageProtectionRules(variation.StorageMod, contractAddr)
 		// 只添加有效的存储规则
 		for _, storageRule := range storageRules {
 			if storageRule.ContractAddress != (gethCommon.Address{}) && storageRule.StorageSlot != (gethCommon.Hash{}) {
@@ -861,23 +1126,23 @@ func (r *AttackReplayer) createProtectionRule(txHash gethCommon.Hash, contractAd
 
 // createFallbackProtectionRule 创建后备保护规则
 func (r *AttackReplayer) createFallbackProtectionRule(txHash gethCommon.Hash, contractAddr gethCommon.Address,
-	similarity float64, variation *ModificationVariation) OnChainProtectionRule {
+	similarity float64, variation *tracingUtils.ModificationVariation) tracingUtils.OnChainProtectionRule {
 
-	ruleID := GenerateRuleID(txHash, contractAddr, time.Now())
+	ruleID := tracingUtils.GenerateRuleID(txHash, contractAddr, time.Now())
 
-	rule := OnChainProtectionRule{
+	rule := tracingUtils.OnChainProtectionRule{
 		RuleID:          ruleID,
 		TxHash:          txHash,
 		ContractAddress: contractAddr,
 		Similarity:      similarity,
-		InputRules:      make([]InputProtectionRule, 0),
-		StorageRules:    make([]StorageProtectionRule, 0),
+		InputRules:      make([]tracingUtils.InputProtectionRule, 0),
+		StorageRules:    make([]tracingUtils.StorageProtectionRule, 0),
 		CreatedAt:       time.Now(),
 		IsActive:        true,
 	}
 
 	// 创建一个基本的存储保护规则
-	basicStorageRule := StorageProtectionRule{
+	basicStorageRule := tracingUtils.StorageProtectionRule{
 		ContractAddress: contractAddr,
 		StorageSlot:     gethCommon.BigToHash(big.NewInt(0)), // 使用槽位0
 		OriginalValue:   gethCommon.Hash{},
@@ -897,16 +1162,16 @@ func (r *AttackReplayer) createFallbackProtectionRule(txHash gethCommon.Hash, co
 // 保持原有方法的兼容性
 
 // executeTransactionWithContext 使用执行上下文执行交易
-func (r *AttackReplayer) executeTransactionWithContext(ctx *ExecutionContext, modifiedInput []byte, storageMods map[gethCommon.Hash]gethCommon.Hash) (*ExecutionPath, error) {
+func (r *AttackReplayer) executeTransactionWithContext(ctx *tracingUtils.ExecutionContext, modifiedInput []byte, storageMods map[gethCommon.Hash]gethCommon.Hash) (*tracingUtils.ExecutionPath, error) {
 	return r.executionEngine.ExecuteTransactionWithContext(ctx, modifiedInput, storageMods)
 }
 
 // 保持原有的辅助方法
-func (r *AttackReplayer) executeTransactionWithTracing(tx *types.Transaction, prestate PrestateResult, modifiedInput []byte, storageMods map[gethCommon.Hash]gethCommon.Hash) (*ExecutionPath, error) {
+func (r *AttackReplayer) executeTransactionWithTracing(tx *types.Transaction, prestate tracingUtils.PrestateResult, modifiedInput []byte, storageMods map[gethCommon.Hash]gethCommon.Hash) (*tracingUtils.ExecutionPath, error) {
 	return r.executionEngine.ExecuteTransactionWithTracing(tx, prestate, modifiedInput, storageMods)
 }
 
-func (r *AttackReplayer) calculatePathSimilarity(path1, path2 *ExecutionPath) float64 {
+func (r *AttackReplayer) calculatePathSimilarity(path1, path2 *tracingUtils.ExecutionPath) float64 {
 	if path1 == nil || path2 == nil {
 		return 0.0
 	}
@@ -942,7 +1207,7 @@ func (r *AttackReplayer) calculatePathSimilarity(path1, path2 *ExecutionPath) fl
 }
 
 // getTransactionCallTrace 获取交易的调用跟踪，提取所有被保护合约的调用数据
-func (r *AttackReplayer) getTransactionCallTrace(txHash gethCommon.Hash, protectedContracts []gethCommon.Address) (*CallTrace, error) {
+func (r *AttackReplayer) getTransactionCallTrace(txHash gethCommon.Hash, protectedContracts []gethCommon.Address) (*tracingUtils.CallTrace, error) {
 	fmt.Printf("=== EXTRACTING CALL TRACE ===\n")
 	fmt.Printf("Transaction hash: %s\n", txHash.Hex())
 	fmt.Printf("Protected contracts: %v\n", protectedContracts)
@@ -957,10 +1222,10 @@ func (r *AttackReplayer) getTransactionCallTrace(txHash gethCommon.Hash, protect
 	rootCall := r.convertCallFrame(callFrame)
 
 	// 创建 CallTrace 结构
-	callTrace := &CallTrace{
+	callTrace := &tracingUtils.CallTrace{
 		OriginalTxHash:     txHash,
 		RootCall:           rootCall,
-		ExtractedCalls:     make([]ExtractedCallData, 0),
+		ExtractedCalls:     make([]tracingUtils.ExtractedCallData, 0),
 		ProtectedContracts: protectedContracts,
 	}
 
@@ -977,12 +1242,12 @@ func (r *AttackReplayer) getTransactionCallTrace(txHash gethCommon.Hash, protect
 }
 
 // convertCallFrame 将 node.callFrame 转换为 tracing.CallFrame
-func (r *AttackReplayer) convertCallFrame(nodeFrame *node.NodecallFrame) *CallFrame {
+func (r *AttackReplayer) convertCallFrame(nodeFrame *node.NodecallFrame) *tracingUtils.CallFrame {
 	if nodeFrame == nil {
 		return nil
 	}
 
-	frame := &CallFrame{
+	frame := &tracingUtils.CallFrame{
 		Type:    nodeFrame.Type,
 		From:    nodeFrame.From,
 		To:      nodeFrame.To,
@@ -994,7 +1259,7 @@ func (r *AttackReplayer) convertCallFrame(nodeFrame *node.NodecallFrame) *CallFr
 
 	// 递归转换子调用
 	if len(nodeFrame.Calls) > 0 {
-		frame.Calls = make([]CallFrame, len(nodeFrame.Calls))
+		frame.Calls = make([]tracingUtils.CallFrame, len(nodeFrame.Calls))
 		for i, subCall := range nodeFrame.Calls {
 			convertedSubCall := r.convertCallFrame(&subCall)
 			if convertedSubCall != nil {
@@ -1007,7 +1272,7 @@ func (r *AttackReplayer) convertCallFrame(nodeFrame *node.NodecallFrame) *CallFr
 }
 
 // extractProtectedContractCalls 递归提取与被保护合约相关的调用数据，只找第一个匹配的
-func (r *AttackReplayer) extractProtectedContractCalls(frame *CallFrame, protectedContracts []gethCommon.Address, extractedCalls *[]ExtractedCallData, depth int) bool {
+func (r *AttackReplayer) extractProtectedContractCalls(frame *tracingUtils.CallFrame, protectedContracts []gethCommon.Address, extractedCalls *[]tracingUtils.ExtractedCallData, depth int) bool {
 	if frame == nil {
 		return false
 	}
@@ -1037,7 +1302,7 @@ func (r *AttackReplayer) extractProtectedContractCalls(frame *CallFrame, protect
 				}
 			}
 
-			extractedCall := ExtractedCallData{
+			extractedCall := tracingUtils.ExtractedCallData{
 				ContractAddress: protectedAddr,
 				From:            fromAddr,
 				InputData:       inputData,
@@ -1068,7 +1333,7 @@ func (r *AttackReplayer) extractProtectedContractCalls(frame *CallFrame, protect
 }
 
 // getTransactionPrestateWithAllContracts 获取交易的预状态，保存所有合约的存储
-func (r *AttackReplayer) getTransactionPrestateWithAllContracts(txHash gethCommon.Hash) (PrestateResult, map[gethCommon.Address]map[gethCommon.Hash]gethCommon.Hash, error) {
+func (r *AttackReplayer) getTransactionPrestateWithAllContracts(txHash gethCommon.Hash) (tracingUtils.PrestateResult, map[gethCommon.Address]map[gethCommon.Hash]gethCommon.Hash, error) {
 	return r.prestateManager.GetTransactionPrestateWithAllContracts(txHash)
 }
 
@@ -1076,11 +1341,11 @@ func (r *AttackReplayer) getTransactionPrestateWithAllContracts(txHash gethCommo
 func (r *AttackReplayer) generateStepBasedModificationCandidatesFromCalls(
 	startID int,
 	count int,
-	extractedCalls []ExtractedCallData,
+	extractedCalls []tracingUtils.ExtractedCallData,
 	originalStorage map[gethCommon.Address]map[gethCommon.Hash]gethCommon.Hash,
-) []*ModificationCandidate {
+) []*tracingUtils.ModificationCandidate {
 
-	candidates := make([]*ModificationCandidate, 0, count)
+	candidates := make([]*tracingUtils.ModificationCandidate, 0, count)
 
 	if len(extractedCalls) == 0 {
 		fmt.Printf("⚠️  No extracted calls available for generating candidates\n")
@@ -1088,7 +1353,7 @@ func (r *AttackReplayer) generateStepBasedModificationCandidatesFromCalls(
 	}
 
 	for i := 0; i < count; i++ {
-		candidate := &ModificationCandidate{
+		candidate := &tracingUtils.ModificationCandidate{
 			ID:             fmt.Sprintf("call_step_candidate_%d", startID+i),
 			GeneratedAt:    time.Now(),
 			StorageChanges: make(map[gethCommon.Hash]gethCommon.Hash),
@@ -1180,7 +1445,7 @@ func (r *AttackReplayer) generateStepBasedInputDataFromCall(originalInput []byte
 		paramData := modified[4:]
 
 		// 根据变异配置选择步长
-		config := r.mutationManager.config
+		config := mutation.DefaultMutationConfig()
 		stepIndex := variant % len(config.InputSteps)
 		step := config.InputSteps[stepIndex]
 
@@ -1197,7 +1462,7 @@ func (r *AttackReplayer) generateStepBasedInputDataFromCall(originalInput []byte
 func (r *AttackReplayer) generateStepBasedStorageChangesFromCall(originalStorage map[gethCommon.Hash]gethCommon.Hash, variant int) map[gethCommon.Hash]gethCommon.Hash {
 	changes := make(map[gethCommon.Hash]gethCommon.Hash)
 
-	config := r.mutationManager.config
+	config := mutation.DefaultMutationConfig()
 	if !config.OnlyPrestate || len(originalStorage) == 0 {
 		fmt.Printf("⚠️  No original storage to mutate or OnlyPrestate disabled\n")
 		return changes
@@ -1249,8 +1514,8 @@ func (r *AttackReplayer) generateStepBasedStorageChangesFromCall(originalStorage
 
 // forceValidModificationFromCall 基于调用数据强制生成有效的修改
 func (r *AttackReplayer) forceValidModificationFromCall(
-	candidate *ModificationCandidate,
-	selectedCall ExtractedCallData,
+	candidate *tracingUtils.ModificationCandidate,
+	selectedCall tracingUtils.ExtractedCallData,
 	originalStorage map[gethCommon.Address]map[gethCommon.Hash]gethCommon.Hash,
 	variant int,
 ) bool {
@@ -1405,7 +1670,7 @@ func (r *AttackReplayer) forceModifyStorageDataFromCall(originalStorage map[geth
 }
 
 // createVirtualStorageModificationFromCall 基于调用数据创建虚拟存储修改
-func (r *AttackReplayer) createVirtualStorageModificationFromCall(selectedCall ExtractedCallData, variant int) map[gethCommon.Hash]gethCommon.Hash {
+func (r *AttackReplayer) createVirtualStorageModificationFromCall(selectedCall tracingUtils.ExtractedCallData, variant int) map[gethCommon.Hash]gethCommon.Hash {
 	changes := make(map[gethCommon.Hash]gethCommon.Hash)
 
 	// 基于调用数据的哈希创建虚拟存储槽
@@ -1424,7 +1689,7 @@ func (r *AttackReplayer) createVirtualStorageModificationFromCall(selectedCall E
 }
 
 // predictModificationImpactFromCall 基于调用数据预测修改影响
-func (r *AttackReplayer) predictModificationImpactFromCall(candidate *ModificationCandidate, selectedCall ExtractedCallData) string {
+func (r *AttackReplayer) predictModificationImpactFromCall(candidate *tracingUtils.ModificationCandidate, selectedCall tracingUtils.ExtractedCallData) string {
 	impact := candidate.ModType
 	if selectedCall.ContractAddress != (gethCommon.Address{}) {
 		impact += fmt.Sprintf("_on_contract_%s", selectedCall.ContractAddress.Hex()[:10])
@@ -1436,7 +1701,7 @@ func (r *AttackReplayer) predictModificationImpactFromCall(candidate *Modificati
 }
 
 // ReplayAndCollectMutations 重放攻击交易并收集所有变异数据（修改版本）
-func (r *AttackReplayer) ReplayAndCollectMutations(txHash gethCommon.Hash, contractAddr gethCommon.Address) (*MutationCollection, error) {
+func (r *AttackReplayer) ReplayAndCollectMutations(txHash gethCommon.Hash, contractAddr gethCommon.Address) (*tracingUtils.MutationCollection, error) {
 	startTime := time.Now()
 
 	fmt.Printf("=== ATTACK TRANSACTION REPLAY WITH MUTATION COLLECTION (ENHANCED) ===\n")
@@ -1481,20 +1746,20 @@ func (r *AttackReplayer) ReplayAndCollectMutations(txHash gethCommon.Hash, contr
 		return nil, fmt.Errorf("failed to get chain ID: %v", err)
 	}
 
-	execCtx, err := NewExecutionContext(tx, receipt, block, chainID, prestate, allContractsStorage)
+	execCtx, err := tracingUtils.NewExecutionContext(tx, receipt, block, chainID, prestate, allContractsStorage)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create execution context: %v", err)
 	}
 	fmt.Printf("✅ Execution context created: ChainID=%s, Block=%d\n", chainID.String(), block.Number.Uint64())
 
 	// 创建变异数据集合
-	mutationCollection := &MutationCollection{
+	mutationCollection := &tracingUtils.MutationCollection{
 		OriginalTxHash:      txHash,
 		ContractAddress:     contractAddr,
 		OriginalInputData:   tx.Data(), // 保留原始交易的输入数据作为参考
 		OriginalStorage:     make(map[gethCommon.Hash]gethCommon.Hash),
-		Mutations:           make([]MutationData, 0),
-		SuccessfulMutations: make([]MutationData, 0),
+		Mutations:           make([]tracingUtils.MutationData, 0),
+		SuccessfulMutations: make([]tracingUtils.MutationData, 0),
 		CreatedAt:           time.Now(),
 		CallTrace:           callTrace,
 		AllContractsStorage: allContractsStorage,
@@ -1506,13 +1771,21 @@ func (r *AttackReplayer) ReplayAndCollectMutations(txHash gethCommon.Hash, contr
 		fmt.Printf("Original storage slots for main contract: %d\n", len(contractAccount.Storage))
 	}
 
-	// 执行原始交易 - 使用执行上下文
+	// 执行原始交易 - 使用 InterceptingEVM 以确保只记录目标合约的跳转
 	fmt.Printf("\n=== ORIGINAL EXECUTION ===\n")
-	originalPath, err := r.executeTransactionWithContext(execCtx, nil, nil)
+	
+	// 设置目标合约，使用空的 targetCalls（不修改输入）
+	targetCalls := make(map[gethCommon.Address][]byte)
+	// 通知 InterceptingEVM 哪些是目标合约，但不修改输入
+	for _, protectedAddr := range protectedContracts {
+		targetCalls[protectedAddr] = nil // nil 表示不修改输入
+	}
+	
+	originalPath, err := r.executionEngine.ExecuteWithInterceptedCalls(execCtx, targetCalls)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute original transaction: %v", err)
 	}
-	fmt.Printf("Original execution path: %d jumps\n", len(originalPath.Jumps))
+	fmt.Printf("Original execution path: %d jumps (target contract only)\n", len(originalPath.Jumps))
 
 	// 如果没有提取到调用数据，回退到原始方法
 	if len(callTrace.ExtractedCalls) == 0 {
@@ -1535,7 +1808,7 @@ func (r *AttackReplayer) ReplayAndCollectMutations(txHash gethCommon.Hash, contr
 
 	// 生成并执行变异（使用基于调用数据的步长变异）
 	fmt.Printf("\n=== GENERATING AND EXECUTING CALL-BASED STEP MUTATIONS ===\n")
-	config := r.mutationManager.config
+	config := mutation.DefaultMutationConfig()
 	fmt.Printf("Using mutation config: InputSteps=%v, StorageSteps=%v, OnlyPrestate=%v\n",
 		config.InputSteps, config.StorageSteps, config.OnlyPrestate)
 
@@ -1549,7 +1822,7 @@ func (r *AttackReplayer) ReplayAndCollectMutations(txHash gethCommon.Hash, contr
 			currentBatchSize = totalCandidates - i
 		}
 
-		var candidates []*ModificationCandidate
+		var candidates []*tracingUtils.ModificationCandidate
 
 		// 如果有提取的调用数据，使用基于调用的变异
 		if len(callTrace.ExtractedCalls) > 0 {
@@ -1564,7 +1837,7 @@ func (r *AttackReplayer) ReplayAndCollectMutations(txHash gethCommon.Hash, contr
 
 		// 收集结果
 		for _, result := range mutationResults {
-			mutationData := MutationData{
+			mutationData := tracingUtils.MutationData{
 				ID:             result.Candidate.ID,
 				InputData:      result.Candidate.InputData,
 				StorageChanges: result.Candidate.StorageChanges,
@@ -1623,4 +1896,422 @@ func (r *AttackReplayer) ReplayAndCollectMutations(txHash gethCommon.Hash, contr
 	fmt.Printf("Contracts with storage: %d\n", len(allContractsStorage))
 
 	return mutationCollection, nil
+}
+
+// ContractAnalysis 合约分析结果
+type ContractAnalysis struct {
+	Address gethCommon.Address `json:"address"`
+	ChainID *big.Int           `json:"chainId"`
+	ABI     *abi.ABI           `json:"abi"`
+	Methods []MethodAnalysis   `json:"methods"`
+}
+
+// MethodAnalysis 方法分析结果
+type MethodAnalysis struct {
+	Name      string              `json:"name"`
+	Signature string              `json:"signature"`
+	Inputs    []ParameterAnalysis `json:"inputs"`
+}
+
+// ParameterAnalysis 参数分析结果
+type ParameterAnalysis struct {
+	Name       string   `json:"name"`
+	Type       string   `json:"type"`
+	Importance float64  `json:"importance"`
+	Strategies []string `json:"strategies"`
+}
+
+// ExecuteSmartMutationCampaign 执行智能变异活动
+func (r *AttackReplayer) ExecuteSmartMutationCampaign(
+	txHash gethCommon.Hash,
+	targetContracts []gethCommon.Address,
+) (*SmartMutationCampaignResult, error) {
+	fmt.Printf("\n=== 开始智能变异活动 ===\n")
+	fmt.Printf("交易哈希: %s\n", txHash.Hex())
+	fmt.Printf("目标合约数量: %d\n", len(targetContracts))
+	
+	startTime := time.Now()
+	
+	// 获取原始交易信息
+	originalTx, _, err := r.client.TransactionByHash(context.Background(), txHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get original transaction: %v", err)
+	}
+	
+	// 获取prestate
+	prestate, err := r.prestateManager.GetPrestate(txHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get prestate: %v", err)
+	}
+	
+	// 分析目标合约
+	contractAnalyses := make(map[gethCommon.Address]*ContractAnalysis)
+	allSlotInfos := make(map[gethCommon.Address][]tracingUtils.StorageSlotInfo)
+	
+	for _, contractAddr := range targetContracts {
+		// 启用类型感知变异
+		if err := r.EnableTypeAwareMutation(contractAddr); err != nil {
+			fmt.Printf("⚠️  Failed to enable type-aware mutation for %s: %v\n", contractAddr.Hex(), err)
+			continue
+		}
+		
+		// 分析合约
+		analysis, err := r.AnalyzeContract(contractAddr)
+		if err != nil {
+			fmt.Printf("⚠️  Failed to analyze contract %s: %v\n", contractAddr.Hex(), err)
+			continue
+		}
+		contractAnalyses[contractAddr] = analysis
+		
+		// 分析存储
+		if contractStorage, exists := prestate[contractAddr]; exists {
+			slotInfos, err := r.storageAnalyzer.AnalyzeContractStorage(contractAddr, contractStorage.Storage)
+			if err != nil {
+				fmt.Printf("⚠️  Failed to analyze storage for %s: %v\n", contractAddr.Hex(), err)
+				continue
+			}
+			allSlotInfos[contractAddr] = slotInfos
+		}
+	}
+	
+	// 生成智能变异计划
+	mutationPlans := make([]*mutation.MutationPlan, 0)
+	for contractAddr, slotInfos := range allSlotInfos {
+		plan := r.smartStrategy.GetOptimalMutationPlan(contractAddr, slotInfos, len(originalTx.Data()))
+		mutationPlans = append(mutationPlans, plan)
+		
+		fmt.Printf("\n📋 为合约 %s 生成变异计划:\n", contractAddr.Hex()[:10]+"...")
+		plan.PrintPlan()
+	}
+	
+	// 执行变异计划
+	campaignResult := &SmartMutationCampaignResult{
+		TransactionHash:    txHash,
+		TargetContracts:   targetContracts,
+		ContractAnalyses:  contractAnalyses,
+		MutationPlans:     mutationPlans,
+		Results:           make([]*SmartMutationResult, 0),
+		StartTime:         startTime,
+	}
+	
+	// 执行每个计划
+	for _, plan := range mutationPlans {
+		planResults, err := r.executeMutationPlan(originalTx, plan, prestate)
+		if err != nil {
+			fmt.Printf("⚠️  Failed to execute plan for %s: %v\n", plan.ContractAddress.Hex(), err)
+			continue
+		}
+		
+		campaignResult.Results = append(campaignResult.Results, planResults...)
+		
+		// 记录结果到智能策略中
+		for _, result := range planResults {
+			mutationResult := mutation.MutationResult{
+				Variant:         result.Variant,
+				ExecutionPath:   result.ExecutionPath,
+				SimilarityScore: result.SimilarityScore,
+				ExecutionTime:   result.ExecutionTime,
+				Success:         result.Success,
+				InputData:       result.MutatedInputData,
+				StorageChanges:  result.StorageChanges,
+				MutationType:    result.Strategy,
+			}
+			r.smartStrategy.RecordMutationResult(mutationResult)
+		}
+	}
+	
+	// 计算总体统计
+	campaignResult.EndTime = time.Now()
+	campaignResult.TotalDuration = campaignResult.EndTime.Sub(campaignResult.StartTime)
+	campaignResult.TotalMutations = len(campaignResult.Results)
+	
+	successCount := 0
+	totalSimilarity := 0.0
+	highestSimilarity := 0.0
+	
+	for _, result := range campaignResult.Results {
+		if result.Success {
+			successCount++
+			totalSimilarity += result.SimilarityScore
+			if result.SimilarityScore > highestSimilarity {
+				highestSimilarity = result.SimilarityScore
+			}
+		}
+	}
+	
+	campaignResult.SuccessCount = successCount
+	campaignResult.SuccessRate = float64(successCount) / float64(campaignResult.TotalMutations)
+	if successCount > 0 {
+		campaignResult.AverageSimilarity = totalSimilarity / float64(successCount)
+	}
+	campaignResult.HighestSimilarity = highestSimilarity
+	
+	// 打印活动结果
+	fmt.Printf("\n=== 智能变异活动完成 ===\n")
+	fmt.Printf("总变异数: %d\n", campaignResult.TotalMutations)
+	fmt.Printf("成功变异: %d\n", campaignResult.SuccessCount)
+	fmt.Printf("成功率: %.2f%%\n", campaignResult.SuccessRate*100)
+	fmt.Printf("平均相似度: %.2f%%\n", campaignResult.AverageSimilarity*100)
+	fmt.Printf("最高相似度: %.2f%%\n", campaignResult.HighestSimilarity*100)
+	fmt.Printf("总耗时: %v\n", campaignResult.TotalDuration)
+	
+	// 显示策略统计
+	fmt.Printf("\n=== 策略性能统计 ===\n")
+	strategyStats := r.smartStrategy.GetStrategyStats()
+	for name, stats := range strategyStats {
+		if stats.TotalAttempts > 0 {
+			fmt.Printf("%s: 成功率=%.2f%%, 平均相似度=%.2f%%, 尝试次数=%d\n",
+				name, stats.SuccessRate*100, stats.AverageSimilarity*100, stats.TotalAttempts)
+		}
+	}
+	
+	return campaignResult, nil
+}
+
+// executeMutationPlan 执行单个变异计划
+func (r *AttackReplayer) executeMutationPlan(
+	originalTx *types.Transaction,
+	plan *mutation.MutationPlan,
+	prestate map[gethCommon.Address]*utils.ContractState,
+) ([]*SmartMutationResult, error) {
+	results := make([]*SmartMutationResult, 0)
+	
+	// 执行存储变异
+	for _, storagePlan := range plan.StorageMutations {
+		result, err := r.executeStorageMutation(originalTx, storagePlan, prestate)
+		if err != nil {
+			fmt.Printf("⚠️  Storage mutation failed: %v\n", err)
+			continue
+		}
+		results = append(results, result)
+	}
+	
+	// 执行输入数据变异
+	for _, inputPlan := range plan.InputMutations {
+		result, err := r.executeInputMutation(originalTx, inputPlan, prestate)
+		if err != nil {
+			fmt.Printf("⚠️  Input mutation failed: %v\n", err)
+			continue
+		}
+		results = append(results, result)
+	}
+	
+	return results, nil
+}
+
+// executeStorageMutation 执行存储变异
+func (r *AttackReplayer) executeStorageMutation(
+	originalTx *types.Transaction,
+	plan mutation.StorageMutationPlan,
+	prestate map[gethCommon.Address]*utils.ContractState,
+) (*SmartMutationResult, error) {
+	startTime := time.Now()
+	
+	// 复制原始存储状态
+	mutatedPrestate := r.copyPrestate(prestate)
+	
+	// 找到对应的合约地址（这里需要根据计划找到正确的合约）
+	var targetContractAddr gethCommon.Address
+	for addr, contractState := range mutatedPrestate {
+		if len(contractState.Storage) > 0 {
+			targetContractAddr = addr
+			break // 简化处理，选择第一个有存储的合约
+		}
+	}
+	
+	// 获取目标合约的存储
+	contractState, exists := mutatedPrestate[targetContractAddr]
+	if !exists {
+		return nil, fmt.Errorf("contract state not found for storage mutation")
+	}
+	
+	// 变异存储
+	mutatedStorage, err := r.storageTypeMutator.MutateStorage(
+		targetContractAddr,
+		contractState.Storage,
+		plan.Variant,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to mutate storage: %v", err)
+	}
+	
+	// 更新预状态
+	contractState.Storage = mutatedStorage
+	
+	// 执行变异后的交易
+	mutatedTx := originalTx // 存储变异不改变交易本身
+	trace, err := r.executionEngine.ExecuteTransaction(mutatedTx, mutatedPrestate)
+	if err != nil {
+		return &SmartMutationResult{
+			Strategy:          plan.Strategy,
+			Variant:           plan.Variant,
+			Success:           false,
+			ExecutionTime:     time.Since(startTime),
+			Error:             err.Error(),
+			TargetSlot:        &plan.TargetSlot,
+		}, nil
+	}
+	
+	// 计算相似度
+	originalTrace, _ := r.executionEngine.ExecuteTransaction(originalTx, prestate)
+	similarity := r.jumpTracer.CalculateSimilarity(originalTrace, trace)
+	
+	result := &SmartMutationResult{
+		Strategy:          plan.Strategy,
+		Variant:           plan.Variant,
+		Success:           true,
+		SimilarityScore:   similarity,
+		ExecutionTime:     time.Since(startTime),
+		ExecutionPath:     trace,
+		StorageChanges:    mutatedStorage,
+		TargetSlot:        &plan.TargetSlot,
+		MutatedInputData:  originalTx.Data(),
+	}
+	
+	return result, nil
+}
+
+// executeInputMutation 执行输入数据变异
+func (r *AttackReplayer) executeInputMutation(
+	originalTx *types.Transaction,
+	plan mutation.InputMutationPlan,
+	prestate map[gethCommon.Address]*utils.ContractState,
+) (*SmartMutationResult, error) {
+	startTime := time.Now()
+	
+	// 变异输入数据
+	mutatedInputData, err := r.inputModifier.ModifyInputDataByStrategy(originalTx.Data(), plan.Strategy, plan.Variant)
+	if err != nil {
+		return &SmartMutationResult{
+			Strategy:          plan.Strategy,
+			Variant:           plan.Variant,
+			Success:           false,
+			ExecutionTime:     time.Since(startTime),
+			Error:             err.Error(),
+			TargetArgIndex:    &plan.TargetArgIndex,
+		}, nil
+	}
+	
+	// 创建变异后的交易
+	mutatedTx := types.NewTransaction(
+		originalTx.Nonce(),
+		*originalTx.To(),
+		originalTx.Value(),
+		originalTx.Gas(),
+		originalTx.GasPrice(),
+		mutatedInputData,
+	)
+	
+	// 执行变异后的交易
+	trace, err := r.executionEngine.ExecuteTransaction(mutatedTx, prestate)
+	if err != nil {
+		return &SmartMutationResult{
+			Strategy:          plan.Strategy,
+			Variant:           plan.Variant,
+			Success:           false,
+			ExecutionTime:     time.Since(startTime),
+			Error:             err.Error(),
+			TargetArgIndex:    &plan.TargetArgIndex,
+			MutatedInputData:  mutatedInputData,
+		}, nil
+	}
+	
+	// 计算相似度
+	originalTrace, _ := r.executionEngine.ExecuteTransaction(originalTx, prestate)
+	similarity := r.jumpTracer.CalculateSimilarity(originalTrace, trace)
+	
+	result := &SmartMutationResult{
+		Strategy:          plan.Strategy,
+		Variant:           plan.Variant,
+		Success:           true,
+		SimilarityScore:   similarity,
+		ExecutionTime:     time.Since(startTime),
+		ExecutionPath:     trace,
+		MutatedInputData:  mutatedInputData,
+		TargetArgIndex:    &plan.TargetArgIndex,
+	}
+	
+	return result, nil
+}
+
+// copyPrestate 复制预状态
+func (r *AttackReplayer) copyPrestate(prestate map[gethCommon.Address]*utils.ContractState) map[gethCommon.Address]*utils.ContractState {
+	copied := make(map[gethCommon.Address]*utils.ContractState)
+	
+	for addr, state := range prestate {
+		copiedStorage := make(map[gethCommon.Hash]gethCommon.Hash)
+		for slot, value := range state.Storage {
+			copiedStorage[slot] = value
+		}
+		
+		copied[addr] = &utils.ContractState{
+			Storage: copiedStorage,
+			Code:    state.Code,
+			Balance: state.Balance,
+			Nonce:   state.Nonce,
+		}
+	}
+	
+	return copied
+}
+
+// GetSmartStrategyStats 获取智能策略统计
+func (r *AttackReplayer) GetSmartStrategyStats() map[string]interface{} {
+	if r.smartStrategy == nil {
+		return map[string]interface{}{"error": "smart strategy not initialized"}
+	}
+	
+	return r.smartStrategy.GetOverallStats()
+}
+
+// UpdateSmartStrategyThreshold 更新智能策略的相似度阈值
+func (r *AttackReplayer) UpdateSmartStrategyThreshold(threshold float64) {
+	if r.smartStrategy != nil {
+		r.smartStrategy.UpdateSimilarityThreshold(threshold)
+		fmt.Printf("🎯 Smart strategy similarity threshold updated to %.2f\n", threshold)
+	}
+}
+
+// ResetSmartStrategy 重置智能策略（用于新实验）
+func (r *AttackReplayer) ResetSmartStrategy() {
+	if r.smartStrategy != nil {
+		r.smartStrategy.ResetStrategies()
+		fmt.Printf("🔄 Smart strategy reset completed\n")
+	}
+}
+
+// SmartMutationCampaignResult 智能变异活动结果 
+type SmartMutationCampaignResult struct {
+	TransactionHash   gethCommon.Hash                           `json:"transactionHash"` 
+	TargetContracts   []gethCommon.Address                      `json:"targetContracts"`
+	ContractAnalyses  map[gethCommon.Address]*ContractAnalysis  `json:"contractAnalyses"`
+	MutationPlans     []*mutation.MutationPlan                           `json:"mutationPlans"`
+	Results           []*SmartMutationResult                    `json:"results"`
+	StartTime         time.Time                                 `json:"startTime"`
+	EndTime           time.Time                                 `json:"endTime"`
+	TotalDuration     time.Duration                             `json:"totalDuration"`
+	TotalMutations    int                                       `json:"totalMutations"`
+	SuccessCount      int                                       `json:"successCount"`
+	SuccessRate       float64                                   `json:"successRate"`
+	AverageSimilarity float64                                   `json:"averageSimilarity"`
+	HighestSimilarity float64                                   `json:"highestSimilarity"`
+}
+
+// SmartMutationResult 智能变异结果
+type SmartMutationResult struct {
+	Strategy          string                           `json:"strategy"`
+	Variant           int                              `json:"variant"`
+	Success           bool                             `json:"success"`
+	SimilarityScore   float64                          `json:"similarityScore"`
+	ExecutionTime     time.Duration                    `json:"executionTime"`
+	ExecutionPath     []string                         `json:"executionPath"`
+	Error             string                           `json:"error,omitempty"`
+	
+	// 变异数据
+	MutatedInputData  []byte                           `json:"mutatedInputData,omitempty"`
+	StorageChanges    map[gethCommon.Hash]gethCommon.Hash `json:"storageChanges,omitempty"`
+	
+	// 目标信息
+	TargetSlot        *gethCommon.Hash                 `json:"targetSlot,omitempty"`
+	TargetArgIndex    *int                             `json:"targetArgIndex,omitempty"`
 }

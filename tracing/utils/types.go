@@ -1,12 +1,305 @@
-package tracing
+package utils
 
 import (
+	"fmt"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	ccrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 	"math/big"
 	"time"
 )
+
+// JumpTracer handles jump instruction tracing for execution path recording
+type JumpTracer struct {
+	contractABIs  map[common.Address]*abi.ABI
+	executionPath *ExecutionPath
+	isTraceActive bool
+	
+	// Fields for target contract tracing
+	targetContract    common.Address // Target contract to track
+	isRecordingActive bool          // Whether we're in the target contract call chain
+	targetCallDepth   int           // Depth when target contract was called
+	currentDepth      int           // Current call depth
+}
+
+// NewJumpTracer creates a new jump tracer
+func NewJumpTracer() *JumpTracer {
+	return &JumpTracer{
+		contractABIs:      make(map[common.Address]*abi.ABI),
+		executionPath:     &ExecutionPath{Jumps: make([]ExecutionJump, 0)},
+		isTraceActive:     false,
+		isRecordingActive: false,
+		targetCallDepth:   -1,
+		currentDepth:      0,
+	}
+}
+
+// AddContractABI adds ABI information for a contract
+func (t *JumpTracer) AddContractABI(address common.Address, contractABI *abi.ABI) {
+	t.contractABIs[address] = contractABI
+}
+
+// StartTrace starts recording execution path
+func (t *JumpTracer) StartTrace() {
+	t.isTraceActive = true
+	t.executionPath = &ExecutionPath{Jumps: make([]ExecutionJump, 0)}
+}
+
+// StopTrace stops recording and returns the execution path
+func (t *JumpTracer) StopTrace() *ExecutionPath {
+	t.isTraceActive = false
+	return t.executionPath
+}
+
+// GetExecutionPath returns the current execution path
+func (t *JumpTracer) GetExecutionPath() *ExecutionPath {
+	return t.executionPath
+}
+
+// SetTargetContract sets the target contract to track
+func (t *JumpTracer) SetTargetContract(addr common.Address) {
+	t.targetContract = addr
+	t.targetCallDepth = -1
+	t.isRecordingActive = false
+}
+
+// OnTargetContractCalled notifies the tracer that the target contract is being called
+func (t *JumpTracer) OnTargetContractCalled(addr common.Address) {
+	if addr == t.targetContract && !t.isRecordingActive {
+		t.isRecordingActive = true
+		t.targetCallDepth = t.currentDepth
+		fmt.Printf("=== JUMP TRACER: Started recording at depth %d for contract %s ===\n", t.currentDepth, addr.Hex())
+	}
+}
+
+// safeStackBack safely gets stack element (from the back)
+func (t *JumpTracer) safeStackBack(stackData []uint256.Int, n int) *uint256.Int {
+	stackLen := len(stackData)
+	if stackLen == 0 || n >= stackLen {
+		return uint256.NewInt(0)
+	}
+	return &stackData[stackLen-1-n]
+}
+
+// onTxStart handles transaction start
+func (t *JumpTracer) onTxStart(vm *tracing.VMContext, tx *types.Transaction, from common.Address) {
+	if t.isTraceActive {
+		fmt.Printf("=== JUMP TRACER: Transaction started ===\n")
+	}
+}
+
+// onTxEnd handles transaction end
+func (t *JumpTracer) onTxEnd(receipt *types.Receipt, err error) {
+	if t.isTraceActive {
+		fmt.Printf("=== JUMP TRACER: Transaction ended, jumps recorded: %d ===\n", len(t.executionPath.Jumps))
+	}
+}
+
+// onEnter handles call start
+func (t *JumpTracer) onEnter(depth int, typ byte, from common.Address, to common.Address, input []byte, gas uint64, value *big.Int) {
+	t.currentDepth = depth
+	
+	// Check if we're entering the target contract
+	if to == t.targetContract && !t.isRecordingActive && t.targetCallDepth == -1 {
+		t.isRecordingActive = true
+		t.targetCallDepth = depth
+		fmt.Printf("=== JUMP TRACER: Started recording at depth %d for contract %s (via onEnter) ===\n", depth, to.Hex())
+	}
+}
+
+// onExit handles call end
+func (t *JumpTracer) onExit(depth int, output []byte, gasUsed uint64, err error, reverted bool) {
+	// Check if we're exiting the target contract call chain
+	if t.isRecordingActive && depth <= t.targetCallDepth {
+		t.isRecordingActive = false
+		fmt.Printf("=== JUMP TRACER: Stopped recording at depth %d (exited target call chain) ===\n", depth)
+	}
+	
+	t.currentDepth = depth
+}
+
+// onOpcode handles opcode tracing - focus on JUMP and JUMPI
+func (t *JumpTracer) onOpcode(pc uint64, opcode byte, gas uint64, cost uint64, scope tracing.OpContext, rData []byte, depth int, err error) {
+	if !t.isTraceActive {
+		return
+	}
+	
+	// Only record if we're in the target contract call chain
+	if t.targetContract != (common.Address{}) && !t.isRecordingActive {
+		return
+	}
+	
+	// Only record if we're at or deeper than the target call depth
+	if t.targetCallDepth != -1 && depth < t.targetCallDepth {
+		return
+	}
+
+	op := vm.OpCode(opcode)
+	contractAddr := scope.Address()
+	stackData := scope.StackData()
+	stackLen := len(stackData)
+
+	switch op {
+	case vm.JUMP:
+		if stackLen > 0 {
+			dest := t.safeStackBack(stackData, 0)
+			jump := ExecutionJump{
+				ContractAddress: contractAddr,
+				JumpFrom:        pc,
+				JumpDest:        dest.Uint64(),
+			}
+			t.executionPath.Jumps = append(t.executionPath.Jumps, jump)
+			if t.isRecordingActive {
+				fmt.Printf("JUMP TRACER: [TARGET CHAIN] JUMP %s: %d -> %d (depth: %d)\n", 
+					contractAddr.Hex(), pc, dest.Uint64(), depth)
+			}
+		}
+
+	case vm.JUMPI:
+		if stackLen >= 2 {
+			dest := t.safeStackBack(stackData, 0)
+			condition := t.safeStackBack(stackData, 1)
+
+			// 只有当条件为真时才记录跳转
+			if condition.Sign() != 0 {
+				jump := ExecutionJump{
+					ContractAddress: contractAddr,
+					JumpFrom:        pc,
+					JumpDest:        dest.Uint64(),
+				}
+				t.executionPath.Jumps = append(t.executionPath.Jumps, jump)
+				if t.isRecordingActive {
+					fmt.Printf("JUMP TRACER: [TARGET CHAIN] JUMPI %s: %d -> %d (condition: %s, depth: %d)\n",
+						contractAddr.Hex(), pc, dest.Uint64(), condition.Hex(), depth)
+				}
+			}
+		}
+	}
+}
+
+// onFault handles execution faults
+func (t *JumpTracer) onFault(pc uint64, opcode byte, gas uint64, cost uint64, scope tracing.OpContext, depth int, err error) {
+	// Not used for jump tracing
+}
+
+// Empty implementations for required interface methods
+func (t *JumpTracer) onGasChange(old, new uint64, reason tracing.GasChangeReason) {}
+func (t *JumpTracer) onBalanceChange(a common.Address, prev, new *big.Int, reason tracing.BalanceChangeReason) {
+}
+func (t *JumpTracer) onNonceChange(a common.Address, prev, new uint64)           {}
+func (t *JumpTracer) onStorageChange(a common.Address, k, prev, new common.Hash) {}
+func (t *JumpTracer) onCodeChange(a common.Address, prevCodeHash common.Hash, prev []byte, codeHash common.Hash, code []byte) {
+}
+func (t *JumpTracer) onLog(log *types.Log) {}
+func (t *JumpTracer) onSystemCallStart()   {}
+func (t *JumpTracer) onSystemCallEnd()     {}
+
+// ToTracingHooks converts JumpTracer to tracing.Hooks struct
+func (t *JumpTracer) ToTracingHooks() *tracing.Hooks {
+	return &tracing.Hooks{
+		OnTxStart:         t.onTxStart,
+		OnTxEnd:           t.onTxEnd,
+		OnEnter:           t.onEnter,
+		OnExit:            t.onExit,
+		OnOpcode:          t.onOpcode,
+		OnFault:           t.onFault,
+		OnGasChange:       t.onGasChange,
+		OnBalanceChange:   t.onBalanceChange,
+		OnNonceChange:     t.onNonceChange,
+		OnCodeChange:      t.onCodeChange,
+		OnStorageChange:   t.onStorageChange,
+		OnLog:             t.onLog,
+		OnSystemCallStart: t.onSystemCallStart,
+		OnSystemCallEnd:   t.onSystemCallEnd,
+	}
+}
+
+// CalculateSimilarity 计算两个执行路径的相似度
+func (t *JumpTracer) CalculateSimilarity(path1, path2 []string) float64 {
+	if len(path1) == 0 && len(path2) == 0 {
+		return 1.0
+	}
+	
+	if len(path1) == 0 || len(path2) == 0 {
+		return 0.0
+	}
+	
+	matches := 0
+	minLen := len(path1)
+	if len(path2) < minLen {
+		minLen = len(path2)
+	}
+	
+	// 计算相同位置的匹配数
+	for i := 0; i < minLen; i++ {
+		if path1[i] == path2[i] {
+			matches++
+		}
+	}
+	
+	// 计算相似度：匹配数 / 最大长度
+	maxLen := len(path1)
+	if len(path2) > maxLen {
+		maxLen = len(path2)
+	}
+	
+	return float64(matches) / float64(maxLen)
+}
+
+// ExecutionContext 包含交易执行过程中不变的上下文信息
+// 通过缓存这些信息，避免在多次变异执行中重复获取
+type ExecutionContext struct {
+	// 交易相关信息
+	Transaction *types.Transaction
+	TxHash      common.Hash
+	From        common.Address
+	
+	// 链上信息
+	Receipt     *types.Receipt
+	Block       *types.Header
+	ChainID     *big.Int
+	
+	// 签名器（基于 chainID 创建）
+	Signer      types.Signer
+	
+	// 预状态信息
+	Prestate    PrestateResult
+	AllContractsStorage map[common.Address]map[common.Hash]common.Hash
+}
+
+// NewExecutionContext 创建新的执行上下文
+func NewExecutionContext(
+	tx *types.Transaction,
+	receipt *types.Receipt,
+	block *types.Header,
+	chainID *big.Int,
+	prestate PrestateResult,
+	allContractsStorage map[common.Address]map[common.Hash]common.Hash,
+) (*ExecutionContext, error) {
+	signer := types.LatestSignerForChainID(chainID)
+	from, err := types.Sender(signer, tx)
+	if err != nil {
+		return nil, err
+	}
+	
+	return &ExecutionContext{
+		Transaction: tx,
+		TxHash:      tx.Hash(),
+		From:        from,
+		Receipt:     receipt,
+		Block:       block,
+		ChainID:     chainID,
+		Signer:      signer,
+		Prestate:    prestate,
+		AllContractsStorage: allContractsStorage,
+	}, nil
+}
 
 // ExecutionJump represents a jump instruction execution
 type ExecutionJump struct {
@@ -731,4 +1024,173 @@ func DefaultConcurrentModificationConfig() *ConcurrentModificationConfig {
 		ChannelBufferSize:   100,
 		BatchSize:           10,
 	}
+}
+
+// InterceptingEVM wraps the standard EVM to intercept and modify calls to specific contracts
+type InterceptingEVM struct {
+	*vm.EVM
+	targetCalls map[common.Address][]byte // 目标合约地址 -> 修改后的InputData
+	jumpTracer  *JumpTracer               // 用于通知何时进入目标合约
+}
+
+// NewInterceptingEVM creates a new InterceptingEVM
+func NewInterceptingEVM(evm *vm.EVM, targetCalls map[common.Address][]byte, jumpTracer *JumpTracer) *InterceptingEVM {
+	return &InterceptingEVM{
+		EVM:         evm,
+		targetCalls: targetCalls,
+		jumpTracer:  jumpTracer,
+	}
+}
+
+// Call intercepts calls and potentially modifies input data for target contracts
+func (e *InterceptingEVM) Call(caller common.Address, addr common.Address, input []byte, gas uint64, value *uint256.Int) (ret []byte, leftOverGas uint64, err error) {
+	// Check if this is a target contract
+	if modifiedInput, exists := e.targetCalls[addr]; exists {
+		// If modifiedInput is nil, just notify without modifying
+		if modifiedInput != nil {
+			input = modifiedInput
+		}
+		// Always notify the JumpTracer
+		if e.jumpTracer != nil {
+			e.jumpTracer.OnTargetContractCalled(addr)
+		}
+	}
+	
+	// Call the underlying EVM with potentially modified input
+	return e.EVM.Call(caller, addr, input, gas, value)
+}
+
+// CallCode intercepts CALLCODE operations
+func (e *InterceptingEVM) CallCode(caller common.Address, addr common.Address, input []byte, gas uint64, value *uint256.Int) (ret []byte, leftOverGas uint64, err error) {
+	// For CALLCODE, we check if the callers address is a target
+	// because code is executed in callers context
+	if modifiedInput, exists := e.targetCalls[caller]; exists {
+		// If modifiedInput is nil, just notify without modifying
+		if modifiedInput != nil {
+			input = modifiedInput
+		}
+		// Always notify the JumpTracer
+		if e.jumpTracer != nil {
+			e.jumpTracer.OnTargetContractCalled(caller)
+		}
+	}
+	
+	return e.EVM.CallCode(caller, addr, input, gas, value)
+}
+
+// DelegateCall intercepts DELEGATECALL operations
+func (e *InterceptingEVM) DelegateCall(caller common.Address, addr common.Address, contextAddr common.Address, input []byte, gas uint64, value *uint256.Int) (ret []byte, leftOverGas uint64, err error) {
+	// For DELEGATECALL, check both the target address and caller
+	// as the code runs in callers context but with targets code
+	if modifiedInput, exists := e.targetCalls[addr]; exists {
+		// If modifiedInput is nil, just notify without modifying
+		if modifiedInput != nil {
+			input = modifiedInput
+		}
+		// Always notify the JumpTracer
+		if e.jumpTracer != nil {
+			e.jumpTracer.OnTargetContractCalled(addr)
+		}
+	}
+	
+	return e.EVM.DelegateCall(caller, addr, contextAddr, input, gas, value)
+}
+
+// StaticCall intercepts STATICCALL operations
+func (e *InterceptingEVM) StaticCall(caller common.Address, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) {
+	// Check if this is a target contract
+	if modifiedInput, exists := e.targetCalls[addr]; exists {
+		// If modifiedInput is nil, just notify without modifying
+		if modifiedInput != nil {
+			input = modifiedInput
+		}
+		// Always notify the JumpTracer
+		if e.jumpTracer != nil {
+			e.jumpTracer.OnTargetContractCalled(addr)
+		}
+	}
+	
+	return e.EVM.StaticCall(caller, addr, input, gas)
+}
+
+// Create intercepts contract creation (though less likely to be used for our case)
+func (e *InterceptingEVM) Create(caller common.Address, code []byte, gas uint64, value *uint256.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
+	// For contract creation, we generally dont intercept
+	// but we could check if the creation code matches a pattern
+	return e.EVM.Create(caller, code, gas, value)
+}
+
+// Create2 intercepts CREATE2 operations
+func (e *InterceptingEVM) Create2(caller common.Address, code []byte, gas uint64, endowment *uint256.Int, salt *uint256.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
+	// For CREATE2, we generally dont intercept
+	return e.EVM.Create2(caller, code, gas, endowment, salt)
+}
+
+// Implement interface requirements by forwarding to the underlying EVM
+func (e *InterceptingEVM) GetEVM() *vm.EVM {
+	return e.EVM
+}
+
+// SetTxContext updates the transaction context
+func (e *InterceptingEVM) SetTxContext(txCtx vm.TxContext) {
+	e.EVM.SetTxContext(txCtx)
+}
+
+// Cancel cancels the EVM execution
+func (e *InterceptingEVM) Cancel() {
+	e.EVM.Cancel()
+}
+
+// Cancelled returns whether execution was cancelled
+func (e *InterceptingEVM) Cancelled() bool {
+	return e.EVM.Cancelled()
+}
+
+// SetPrecompiles sets the precompiled contracts
+func (e *InterceptingEVM) SetPrecompiles(precompiles vm.PrecompiledContracts) {
+	e.EVM.SetPrecompiles(precompiles)
+}
+
+// ChainConfig returns the chain configuration
+func (e *InterceptingEVM) ChainConfig() *params.ChainConfig {
+	return e.EVM.ChainConfig()
+}
+
+// StorageSlotType 存储槽类型
+type StorageSlotType string
+
+const (
+	// 基础类型
+	StorageTypeUint256    StorageSlotType = "uint256"
+	StorageTypeAddress    StorageSlotType = "address"
+	StorageTypeBool       StorageSlotType = "bool"
+	StorageTypeBytes32    StorageSlotType = "bytes32"
+	StorageTypeString     StorageSlotType = "string"
+	StorageTypeBytes      StorageSlotType = "bytes"
+	
+	// 复合类型
+	StorageTypeMapping    StorageSlotType = "mapping"
+	StorageTypeArray      StorageSlotType = "array"
+	StorageTypeStruct     StorageSlotType = "struct"
+	
+	// 特殊类型
+	StorageTypeUnknown    StorageSlotType = "unknown"
+	StorageTypeEmpty      StorageSlotType = "empty"
+)
+
+// StorageSlotInfo 存储槽信息
+type StorageSlotInfo struct {
+	Slot        common.Hash     `json:"slot"`
+	SlotType    StorageSlotType `json:"slotType"`
+	Value       common.Hash     `json:"value"`
+	Description string          `json:"description"`
+	AbiType     *abi.Type       `json:"abiType,omitempty"`
+	
+	// 对于mapping和array
+	KeyType   *abi.Type `json:"keyType,omitempty"`
+	ValueType *abi.Type `json:"valueType,omitempty"`
+	
+	// 变异策略信息
+	MutationStrategies []string `json:"mutationStrategies"`
+	ImportanceScore    float64  `json:"importanceScore"`
 }

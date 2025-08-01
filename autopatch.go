@@ -7,7 +7,7 @@ import (
 	"github.com/DQYXACML/autopatch/storage"
 	"github.com/DQYXACML/autopatch/synchronizer"
 	"github.com/DQYXACML/autopatch/synchronizer/node"
-	"github.com/DQYXACML/autopatch/tracing"
+	"github.com/DQYXACML/autopatch/tracing/core"
 	common2 "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
 	"math/big"
@@ -35,7 +35,7 @@ func NewAutoPatch(ctx context.Context, cfg *config.Config) (*AutoPatch, error) {
 		return nil, err
 	}
 
-	mytracer := tracing.NewTracer(ethClient)
+	mytracer := core.NewTracer(ethClient)
 	err = mytracer.TraceTransaction(common2.HexToHash("0x9e63085271890a141297039b3b711913699f1ee4db1acb667ad7ce304772036b"))
 	if err != nil {
 		log.Error("trace transaction fail", "err", err)

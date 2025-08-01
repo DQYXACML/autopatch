@@ -21,7 +21,8 @@ make bindings               # Generate Go bindings from Solidity ABI
 ### Testing
 ```bash
 make test                   # Run all tests with verbose output
-go test ./tracing -v        # Run tests for a specific package
+go test ./tracing/... -v    # Run tests for all tracing subpackages
+go test ./tracing/core -v   # Run tests for specific tracing subpackage
 ```
 
 ### Linting
@@ -50,13 +51,36 @@ make clean                  # Remove built binaries
    - Storage parser for contract analysis
    - Lifecycle management (Start/Stop)
 
-2. **Tracing Module** (`tracing/`): Transaction analysis engine
-   - `txReplayer.go`: Replays transactions with modifications
-   - `execution_engine.go`: Executes transactions in simulated environment
-   - `state_manager.go`: Manages blockchain state during replay
-   - `mutation_manager.go`: Handles transaction mutations
-   - `call_tracer.go`: Traces EVM call stack
-   - `customTracer.go`: Custom EVM opcode tracer
+2. **Tracing Module** (`tracing/`): Transaction analysis engine with modular architecture
+   - **Core** (`tracing/core/`): Core tracing functionality
+     - `tracing.go`: Main tracing interface
+     - `call_tracer.go`: Traces EVM call stack
+     - `customTracer.go`: Custom EVM opcode tracer
+     - `execution_engine.go`: Executes transactions in simulated environment
+   - **Replay** (`tracing/replay/`): Transaction replay and interception
+     - `txReplayer.go`: Replays transactions with modifications
+     - `execution_context.go`: Execution context management
+     - `intercepting_evm.go`: EVM call interception
+   - **State** (`tracing/state/`): State management
+     - `state_manager.go`: Manages blockchain state during replay
+     - `prestate_manager.go`: Pre-state preparation and management
+   - **Mutation** (`tracing/mutation/`): Transaction mutation functionality
+     - `mutation_manager.go`: Handles transaction mutations
+     - `modifier.go`: Transaction modification utilities
+     - `type_aware_mutator.go`: Type-aware parameter mutation
+     - `smart_mutation_strategy.go`: Intelligent mutation strategies
+   - **Analysis** (`tracing/analysis/`): Storage and execution analysis
+     - `storage_analyzer.go`: Smart contract storage analysis
+   - **Config** (`tracing/config/`): Configuration management
+     - `config_manager.go`: Configuration loading and validation
+     - `config_validation.go`: Configuration validation logic
+   - **ABI** (`tracing/abi/`): ABI management
+     - `abi_manager.go`: Contract ABI fetching and caching
+   - **Utils** (`tracing/utils/`): Shared utilities
+     - `types.go`: Common type definitions
+     - `errors.go`: Error handling utilities
+     - `metrics.go`: Performance metrics
+     - `concurrency.go`: Concurrency management
 
 3. **Synchronizer** (`synchronizer/`): Blockchain data synchronization
    - Fetches headers, blocks, and transactions

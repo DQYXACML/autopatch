@@ -1,4 +1,4 @@
-package tracing
+package state
 
 import (
 	"fmt"
@@ -14,22 +14,23 @@ import (
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
 	"github.com/holiman/uint256"
+	tracingUtils "github.com/DQYXACML/autopatch/tracing/utils"
 )
 
 // StateManager 管理状态数据库和EVM创建
 type StateManager struct {
-	jumpTracer *JumpTracer
+	jumpTracer *tracingUtils.JumpTracer
 }
 
 // NewStateManager 创建状态管理器
-func NewStateManager(jumpTracer *JumpTracer) *StateManager {
+func NewStateManager(jumpTracer *tracingUtils.JumpTracer) *StateManager {
 	return &StateManager{
 		jumpTracer: jumpTracer,
 	}
 }
 
 // CreateStateFromPrestate 从预状态创建状态数据库
-func (sm *StateManager) CreateStateFromPrestate(prestate PrestateResult) (*state.StateDB, error) {
+func (sm *StateManager) CreateStateFromPrestate(prestate tracingUtils.PrestateResult) (*state.StateDB, error) {
 	memDb := rawdb.NewMemoryDatabase()
 
 	trieDB := triedb.NewDatabase(memDb, &triedb.Config{
@@ -65,21 +66,21 @@ func (sm *StateManager) CreateStateFromPrestate(prestate PrestateResult) (*state
 
 			// 检查字节码中是否包含PUSH0指令 (0x5f)
 			containsPush0 := false
-			for i, b := range code {
+			for _, b := range code {
 				if b == 0x5f {
 					containsPush0 = true
-					fmt.Printf("Found PUSH0 instruction at position %d in contract %s\n", i, addr.Hex())
+					//fmt.Printf("Found PUSH0 instruction at position %d in contract %s\n", i, addr.Hex())
 				}
 			}
 
 			if containsPush0 {
-				fmt.Printf("Contract %s contains PUSH0 instructions, code length: %d\n", addr.Hex(), len(code))
+				//fmt.Printf("Contract %s contains PUSH0 instructions, code length: %d\n", addr.Hex(), len(code))
 				// 显示前100字节的十六进制表示
 				maxLen := len(code)
 				if maxLen > 100 {
 					maxLen = 100
 				}
-				fmt.Printf("First %d bytes: %x\n", maxLen, code[:maxLen])
+				//fmt.Printf("First %d bytes: %x\n", maxLen, code[:maxLen])
 			}
 
 			stateDB.SetCode(addr, code)
@@ -202,4 +203,28 @@ func (sm *StateManager) CreateChainConfigWithAllForks(chainID *big.Int, blockHea
 	}
 
 	return config
+}
+
+// CreateInterceptingEVM 创建拦截型EVM，可以动态修改特定合约的输入
+func (sm *StateManager) CreateInterceptingEVM(
+	stateDB *state.StateDB,
+	blockHeader *types.Header,
+	chainID *big.Int,
+	targetCalls map[gethCommon.Address][]byte,
+) (*tracingUtils.InterceptingEVM, error) {
+	// 创建原始EVM
+	evm, err := sm.CreateEVMWithTracer(stateDB, blockHeader, chainID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create EVM with tracer: %v", err)
+	}
+
+	// 包装成InterceptingEVM
+	interceptingEVM := tracingUtils.NewInterceptingEVM(evm, targetCalls, sm.jumpTracer)
+
+	fmt.Printf("Created InterceptingEVM with %d target contracts\n", len(targetCalls))
+	for addr := range targetCalls {
+		fmt.Printf("  Target contract: %s\n", addr.Hex())
+	}
+
+	return interceptingEVM, nil
 }

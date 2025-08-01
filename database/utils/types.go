@@ -2,6 +2,7 @@ package utils
 
 import (
 	"io"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -41,4 +42,13 @@ func (b Bytes) Bytes() []byte {
 }
 func (b *Bytes) SetBytes(bytes []byte) {
 	*b = bytes
+}
+
+// ContractState 表示合约在特定时刻的状态
+type ContractState struct {
+	Address common.Address                 `json:"address"`
+	Storage map[common.Hash]common.Hash    `json:"storage"`
+	Code    []byte                         `json:"code"`
+	Balance *big.Int                       `json:"balance"`
+	Nonce   uint64                         `json:"nonce"`
 }

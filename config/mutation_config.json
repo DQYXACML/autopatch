@@ -1,0 +1,61 @@
+{
+  "enableTypeAware": true,
+  "fallbackToGeneric": true,
+  "maxMutations": 1000,
+  "chains": {
+    "ethereum": {
+      "chainId": 1,
+      "name": "ethereum",
+      "explorerApiKey": "",
+      "explorerApi": "https://api.etherscan.io/api",
+      "knownAddresses": [
+        "0x0000000000000000000000000000000000000000",
+        "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+        "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
+      ],
+      "enableTypeAware": true
+    },
+    "bsc": {
+      "chainId": 56,
+      "name": "bsc",
+      "explorerApiKey": "",
+      "explorerApi": "https://api.bscscan.com/api",
+      "knownAddresses": [
+        "0x0000000000000000000000000000000000000000",
+        "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+        "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56",
+        "0x10ED43C718714eb63d5aA57B78B54704E256024E",
+        "0x8894E0a0c962CB723c1976a4421c95949bE2D4E3"
+      ],
+      "enableTypeAware": true
+    }
+  },
+  "addressMutation": {
+    "useKnownAddresses": true,
+    "flipBytes": [1, 2, 4, 8],
+    "nearbyRange": 1000,
+    "zeroAddressRatio": 0.1
+  },
+  "numberMutation": {
+    "boundaryValues": true,
+    "stepSizes": [1, 10, 100, 1000, 10000, -1, -10, -100, -1000],
+    "multiplierRatio": 0.2,
+    "bitPatterns": true
+  },
+  "stringMutation": {
+    "maxLength": 1000,
+    "specialChars": true,
+    "encodingTests": true,
+    "truncation": true
+  },
+  "execution": {
+    "maxConcurrentWorkers": 8,
+    "batchSize": 100,
+    "timeoutSeconds": 30,
+    "similarityThreshold": 0.8,
+    "enableEarlyPruning": true,
+    "cacheSize": 10000
+  }
+}

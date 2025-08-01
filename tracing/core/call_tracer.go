@@ -1,4 +1,4 @@
-package tracing
+package core
 
 import (
 	"github.com/DQYXACML/autopatch/synchronizer/node"

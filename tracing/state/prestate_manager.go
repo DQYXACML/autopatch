@@ -1,11 +1,14 @@
-package tracing
+package state
 
 import (
 	"context"
 	"fmt"
+	"math/big"
 
+	"github.com/DQYXACML/autopatch/database/utils"
 	gethCommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
+	tracingUtils "github.com/DQYXACML/autopatch/tracing/utils"
 )
 
 // PrestateManager 管理预状态获取和处理
@@ -21,7 +24,7 @@ func NewPrestateManager(client *ethclient.Client) *PrestateManager {
 }
 
 // GetTransactionPrestateWithAllContracts 获取交易的预状态，保存所有合约的存储
-func (pm *PrestateManager) GetTransactionPrestateWithAllContracts(txHash gethCommon.Hash) (PrestateResult, map[gethCommon.Address]map[gethCommon.Hash]gethCommon.Hash, error) {
+func (pm *PrestateManager) GetTransactionPrestateWithAllContracts(txHash gethCommon.Hash) (tracingUtils.PrestateResult, map[gethCommon.Address]map[gethCommon.Hash]gethCommon.Hash, error) {
 	fmt.Printf("=== GETTING PRESTATE WITH ALL CONTRACTS ===\n")
 
 	config := map[string]interface{}{
@@ -32,7 +35,7 @@ func (pm *PrestateManager) GetTransactionPrestateWithAllContracts(txHash gethCom
 		"timeout": "60s",
 	}
 
-	var result PrestateResult
+	var result tracingUtils.PrestateResult
 	err := pm.client.Client().CallContext(context.Background(), &result,
 		"debug_traceTransaction", txHash, config)
 	if err != nil {
@@ -55,4 +58,34 @@ func (pm *PrestateManager) GetTransactionPrestateWithAllContracts(txHash gethCom
 
 	fmt.Printf("📦 Total contracts with storage: %d\n", len(allContractsStorage))
 	return result, allContractsStorage, nil
+}
+
+// GetPrestate 获取交易的预状态，返回ContractState格式
+func (pm *PrestateManager) GetPrestate(txHash gethCommon.Hash) (map[gethCommon.Address]*utils.ContractState, error) {
+	prestateResult, _, err := pm.GetTransactionPrestateWithAllContracts(txHash)
+	if err != nil {
+		return nil, err
+	}
+	
+	contractStates := make(map[gethCommon.Address]*utils.ContractState)
+	
+	// 转换为ContractState格式
+	for addr, account := range prestateResult {
+		if account != nil {
+			var balance *big.Int
+			if account.Balance != nil {
+				balance = (*big.Int)(account.Balance)
+			}
+			
+			contractStates[addr] = &utils.ContractState{
+				Address: addr,
+				Storage: account.Storage,
+				Code:    account.Code,
+				Balance: balance,
+				Nonce:   account.Nonce,
+			}
+		}
+	}
+	
+	return contractStates, nil
 }
